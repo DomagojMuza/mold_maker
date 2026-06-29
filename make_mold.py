@@ -2,19 +2,25 @@
 """
 make_mold.py  --  automated cast-mould generator (Blender headless)
 
+Matrix (glove) mould: a rigid shell that the base MODEL sits inside; silicone is
+poured into the gap (= CORE_OFFSET) between model and shell. A separate cradle
+locates both and seals the open bottom.
+
 Pipeline (no clicking):
   1. import master mesh (STL)
   2. decimate to target poly budget (skips if already low)
   3. clean / make manifold via voxel remesh
-  4. build OUTER solid  = model offset OUT by SHELL_OFFSET   (the mould wall)
+  4. build OUTER solid  = model offset OUT by SHELL_OFFSET   (the shell wall)
   5. build FLANGE blob  = model offset OUT by SHELL_OFFSET+FLANGE_REACH
         -> intersect a thin vertical slab (FLANGE_THICK) on the parting plane(s)
-  6. mould body = OUTER (union flange band(s)) MINUS the NEGATIVE (cavity cutter)
-        -> the pour cavity (= model + CORE_OFFSET clearance) is carved out
-  7. flat-bottom cut -> pour mouth + stand
-  8. split body by vertical plane(s) + add ball registration keys:
+  6. shell body = OUTER (union flange band(s)) MINUS the NEGATIVE (model+gap)
+        -> the silicone gap (= model + CORE_OFFSET) is carved out
+  7. flat-bottom cut: bottom stays OPEN (the cradle is the floor)
+  8. sprue funnel on top (top pour mode)
+  9. cradle STL: centre pocket = model, outer recess = shell, ridge = gap seal
+ 10. split body by vertical plane(s) + ball registration keys:
         1 flange -> 2 pieces   |   2 flanges @90deg -> 4 pieces
-  9. export every mould piece as STL  (solid cast: NO separate core piece)
+ 11. export shell pieces + cradle as STL
 
 Run:
   blender --background --python make_mold.py -- input.stl [outdir] [--four] [--voxel 0.6] [--target 6000]
@@ -48,6 +54,21 @@ PIN_RADIUS    = 2.0    # mm, ball key radius (must be < FLANGE_THICK/2 to stay b
 PIN_CLEAR     = 0.25   # mm, socket oversize so the male ball drops in
 PIN_COUNT     = None   # pins per interface up the height. None -> auto (1 per ~40mm)
 VOXEL_SIZE    = None   # set via --voxel to override auto value (mm)
+
+# pour inlet  (bottom is always OPEN -- the cradle is the floor)
+POUR_MODE     = "top"  # "top" = add a sprue funnel to pour from the top
+                       # "bottom" = no sprue, pour through the open bottom
+SPRUE_TOP_R   = 7.0    # mm, funnel mouth radius (top of sprue)
+SPRUE_THROAT_R= 2.5    # mm, funnel throat radius (where it enters the cavity)
+
+# base cradle: locates the base MODEL (centre pocket) AND the mould shell (outer
+# recess); the thin ridge between them seals the silicone gap at the bottom.
+ADD_CRADLE    = True
+CRADLE_WALL   = 4.0    # mm, wall thickness around the shell recess
+CRADLE_RECESS = 2.0    # mm, how deep model + shell seat into the cradle
+                       #   (just enough to locate; deeper = more model lost in base)
+CRADLE_FLOOR  = 3.0    # mm, tray floor thickness
+CRADLE_TOL    = 0.5    # mm, pocket oversize (fit + base-material expansion)
 
 # ----------------------------------------------------------------------------
 # small helpers
@@ -135,6 +156,35 @@ def make_ball(name, center, r):
     bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
     return c
 
+def make_cone(name, center, r_bot, r_top, depth):
+    bpy.ops.mesh.primitive_cone_add(radius1=r_bot, radius2=r_top, depth=depth,
+                                    vertices=48, location=center)
+    c = bpy.context.active_object
+    c.name = name
+    activate(c)
+    bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+    return c
+
+def make_cyl(name, center, r, depth):
+    bpy.ops.mesh.primitive_cylinder_add(radius=r, depth=depth, vertices=32, location=center)
+    c = bpy.context.active_object
+    c.name = name
+    activate(c)
+    bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+    return c
+
+def ray_edge(obj, origin, direction):
+    """world-space hit point where a ray first meets obj, or None."""
+    mw = obj.matrix_world; invw = mw.inverted()
+    ol = invw @ Vector(origin)
+    dl = (invw.to_3x3() @ Vector(direction)).normalized()
+    res = obj.ray_cast(ol, dl)
+    return (mw @ res[1]) if res[0] else None
+
+def mesh_volume(obj):
+    bm = bmesh.new(); bm.from_mesh(obj.data); v = bm.calc_volume(); bm.free()
+    return abs(v)
+
 def export_stl(obj, path):
     activate(obj)
     try:
@@ -169,6 +219,8 @@ while i < len(argv):
     elif a == "--nopins":   ADD_PINS = False
     elif a == "--pin":      PIN_RADIUS = float(argv[i+1]); i += 1
     elif a == "--pins-n":   PIN_COUNT = int(argv[i+1]); i += 1
+    elif a == "--pour":     POUR_MODE = argv[i+1]; i += 1   # "top" | "bottom"
+    elif a == "--nocradle": ADD_CRADLE = False
     elif not a.startswith("--"): outdir = os.path.abspath(a)
     i += 1
 os.makedirs(outdir, exist_ok=True)
@@ -218,18 +270,7 @@ span   = maxdim * 4.0                       # big enough to cover everything
 vs     = VOXEL_SIZE if VOXEL_SIZE else max(diag / VOXEL_DETAIL, 0.25)
 log(f"bbox {tuple(round(v,1) for v in size)}  voxel={vs:.3f}mm")
 
-# flat bottom cut height. Referenced to the MODEL's lowest point (mn.z).
-# Default = exactly at the model bottom: shaves only the shell skirt that hangs
-# below the part, gives a flat foot, and opens the pour mouth -- without biting
-# into the actual part. BASE_CUT > 0 raises the cut (bigger mouth, eats part).
-if BASE_CUT is None:
-    cutz = mn.z
-elif BASE_CUT < 0:
-    cutz = None                       # disabled
-else:
-    cutz = mn.z + BASE_CUT
-if cutz is not None:
-    log(f"flat bottom cut @ z={cutz:.2f} ({cutz - mn.z:+.2f}mm vs model bottom)")
+cutz = None   # flat-bottom cut height, decided after the cavity is built (pour mode)
 
 def cut_bottom_box(obj):
     """Flat bottom via boolean intersect with a half-space box (caps the ring
@@ -272,19 +313,79 @@ if ADD_FLANGE:
 else:
     log("flange: OFF (bare split)")
 
-# carve the pour cavity: the NEGATIVE cuts the cavity out of the shell.
-# cavity = model grown by CORE_OFFSET clearance (0 = exact model).
+# ----------------------------------------------------------------------------
+# 4. carve the pour cavity (NEGATIVE cuts the cavity out of the shell)
+# ----------------------------------------------------------------------------
 negative = offset_solid(master, CORE_OFFSET, vs, "negative") if CORE_OFFSET > 1e-6 \
            else dup(master, "negative")
-boolean(outer, negative, 'DIFFERENCE')
+neg_mn, neg_mx = world_bbox(negative)
+cavity_vol = mesh_volume(negative)
+log(f"cavity volume ~ {cavity_vol/1000:.1f} cm3 -> ~{cavity_vol/1000:.1f} ml of cast material")
+log(f"mould wall = {SHELL_OFFSET}mm  (cavity clearance {CORE_OFFSET}mm)")
+
+# sample cavity high points (ray straight down onto the negative) for sprue+vents
+high_pts = []
+if POUR_MODE == "top":
+    g = 18
+    for ix in range(g):
+        for iy in range(g):
+            x = neg_mn.x + (neg_mx.x - neg_mn.x) * (ix + 0.5) / g
+            y = neg_mn.y + (neg_mx.y - neg_mn.y) * (iy + 0.5) / g
+            hit = ray_edge(negative, (x, y, neg_mx.z + span), (0, 0, -1))
+            if hit:
+                high_pts.append(hit)
+    high_pts.sort(key=lambda p: -p.z)
+
+boolean(outer, negative, 'DIFFERENCE')         # negative consumed
 body = outer
 body.name = "mould_body"
 
-# flat bottom -> pour mouth + stand (do it before splitting)
+# ----------------------------------------------------------------------------
+# flat-bottom cut: bottom is ALWAYS open (the cradle is the floor). Cut at the
+# model bottom so the cavity opens there and the model can seat in the cradle.
+# ----------------------------------------------------------------------------
+if BASE_CUT is not None and BASE_CUT < 0:
+    cutz = None                                 # --nobase: no cut
+else:
+    cutz = mn.z + (BASE_CUT or 0.0)
+if cutz is not None:
+    log(f"flat bottom cut (open) @ z={cutz:.2f}")
 cut_bottom_box(body)
 
 # ----------------------------------------------------------------------------
-# 5. split into pieces with vertical half-space boxes
+# 5. pour inlet: sprue funnel -- top mode only
+# ----------------------------------------------------------------------------
+if POUR_MODE == "top" and high_pts:
+    top_z = world_bbox(body)[1].z + 1.0
+    sp = high_pts[0]                            # cavity apex -> sprue
+    throat_z = sp.z - 1.5                       # punch slightly into the cavity
+    boolean(body, make_cone("sprue",
+                            Vector((sp.x, sp.y, (top_z + throat_z) / 2)),
+                            SPRUE_THROAT_R, SPRUE_TOP_R, top_z - throat_z), 'DIFFERENCE')
+    log(f"sprue @ ({sp.x:.0f},{sp.y:.0f},{sp.z:.0f})")
+
+# ----------------------------------------------------------------------------
+# 6. base cradle (separate STL): centre pocket = base MODEL, outer recess =
+#    mould SHELL. The ridge between them (= the silicone gap) seals the bottom.
+#    Both pockets oversized by CRADLE_TOL for fit + base-material expansion.
+# ----------------------------------------------------------------------------
+if ADD_CRADLE and cutz is not None:
+    shell_cut = offset_solid(body,   CRADLE_TOL, vs, "cr_shell")   # mould footprint + tol
+    model_cut = offset_solid(master, CRADLE_TOL, vs, "cr_model")   # base model + tol
+    smn, smx = world_bbox(shell_cut)
+    rim_z, bot_z = cutz + CRADLE_RECESS, cutz - CRADLE_FLOOR
+    plate = make_box("cradle",
+                     Vector((center.x, center.y, (rim_z + bot_z) / 2)),
+                     ((smx.x - smn.x) + 2 * CRADLE_WALL,
+                      (smx.y - smn.y) + 2 * CRADLE_WALL, rim_z - bot_z))
+    boolean(plate, shell_cut, 'DIFFERENCE')     # outer recess -> locates the shell
+    boolean(plate, model_cut, 'DIFFERENCE')     # centre pocket -> locates the model
+    export_stl(plate, os.path.join(outdir, f"{stem}_cradle.stl"))
+    rm(plate)
+    log(f"cradle: model pocket + shell recess (tol {CRADLE_TOL}mm)")
+
+# ----------------------------------------------------------------------------
+# 7. split into pieces with vertical half-space boxes (+ ball keys)
 # ----------------------------------------------------------------------------
 def halfspace(name, axis, keep_low):
     """box occupying the keep side of the parting plane on the given axis."""
@@ -316,14 +417,6 @@ else:
     pin_zs = [zlo + (zhi - zlo) * k / (n_pins - 1) for k in range(n_pins)]
 if keys_on:
     log(f"pins: up to {n_pins} per interface")
-
-def ray_edge(obj, origin, direction):
-    """world-space hit point where a ray first meets obj, or None."""
-    mw = obj.matrix_world; invw = mw.inverted()
-    ol = invw @ Vector(origin)
-    dl = (invw.to_3x3() @ Vector(direction)).normalized()
-    res = obj.ray_cast(ol, dl)
-    return (mw @ res[1]) if res[0] else None
 
 def lip(plus, along, pz):
     """find pin coord on axis `along` ('x'/'y') just inside the flange edge,
@@ -380,4 +473,7 @@ else:
 for tag, p in pieces:
     export_stl(p, os.path.join(outdir, f"{stem}_mould_{tag}.stl"))
 
-log(f"DONE -> {len(pieces)} mould pieces in {outdir}")
+extras = []
+if POUR_MODE == "top": extras.append("sprue")
+if ADD_CRADLE: extras.append("cradle")
+log(f"DONE -> {len(pieces)} mould pieces" + (f" + {', '.join(extras)}" if extras else "") + f" in {outdir}")
