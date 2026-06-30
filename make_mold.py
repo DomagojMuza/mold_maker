@@ -56,10 +56,11 @@ PIN_COUNT     = None   # pins per interface up the height. None -> auto (1 per ~
 VOXEL_SIZE    = None   # set via --voxel to override auto value (mm)
 
 # pour inlet  (bottom is always OPEN -- the cradle is the floor)
-POUR_MODE     = "top"  # "top" = add a sprue funnel to pour from the top
-                       # "bottom" = no sprue, pour through the open bottom
-SPRUE_TOP_R   = 7.0    # mm, funnel mouth radius (top of sprue)
-SPRUE_THROAT_R= 2.5    # mm, funnel throat radius (where it enters the cavity)
+POUR_MODE     = "top"  # "top" = add a pour reservoir on top
+                       # "bottom" = no reservoir, pour through the open bottom
+POUR_R        = 6.0    # mm, reservoir post outer radius (overflow cup wall)
+POUR_BORE     = 3.0    # mm, pour channel / overflow bore radius
+POUR_RES_H    = 12.0   # mm, reservoir height above the shell roof
 
 # base cradle: locates the base MODEL (centre pocket) AND the mould shell (outer
 # recess); the thin ridge between them seals the silicone gap at the bottom.
@@ -129,11 +130,11 @@ def offset_solid(base, dist, vs, name):
         voxel_remesh(o, vs)                   # heal before the next push
     return o
 
-def boolean(a, b, op, keep_b=False):
+def boolean(a, b, op, keep_b=False, solver='EXACT'):
     """a = a <op> b   (op: 'UNION' | 'DIFFERENCE' | 'INTERSECT')."""
     m = a.modifiers.new("bool", 'BOOLEAN')
     m.operation = op
-    m.solver = 'EXACT'
+    m.solver = solver
     m.object = b
     apply_mod(a, m.name)
     if not keep_b:
@@ -267,7 +268,9 @@ size   = mx - mn
 maxdim = max(size.x, size.y, size.z)
 diag   = size.length
 span   = maxdim * 4.0                       # big enough to cover everything
-vs     = VOXEL_SIZE if VOXEL_SIZE else max(diag / VOXEL_DETAIL, 0.25)
+# voxel size: auto from bbox, but CAPPED at 0.5mm -- coarser than that makes the
+# EXACT booleans fail (the offset surfaces under-resolve and the carve collapses).
+vs     = VOXEL_SIZE if VOXEL_SIZE else min(max(diag / VOXEL_DETAIL, 0.25), 0.5)
 log(f"bbox {tuple(round(v,1) for v in size)}  voxel={vs:.3f}mm")
 
 cutz = None   # flat-bottom cut height, decided after the cavity is built (pour mode)
@@ -288,11 +291,14 @@ voxel_remesh(master, vs)
 
 # ----------------------------------------------------------------------------
 # 3. OUTER shell solid + optional FLANGE band(s)
+#    OUTER = model + cavity gap + wall, so the shell wall ends up SHELL_OFFSET
+#    thick AROUND the cavity (cavity = model + CORE_OFFSET).
 # ----------------------------------------------------------------------------
-outer = offset_solid(master, SHELL_OFFSET, vs, "outer")
+WALL_OUT = CORE_OFFSET + SHELL_OFFSET
+outer = offset_solid(master, WALL_OUT, vs, "outer")
 
 if ADD_FLANGE:
-    flangeblob = offset_solid(master, SHELL_OFFSET + FLANGE_REACH, vs, "flangeblob")
+    flangeblob = offset_solid(master, WALL_OUT + FLANGE_REACH, vs, "flangeblob")
 
     def flange_band(normal_axis):
         """slab thin along normal_axis, centred on parting plane, clipped to flangeblob."""
@@ -352,16 +358,21 @@ if cutz is not None:
 cut_bottom_box(body)
 
 # ----------------------------------------------------------------------------
-# 5. pour inlet: sprue funnel -- top mode only
+# 5. pour inlet: reservoir post at the pour point (= cavity apex / highest point).
+#    A solid cylinder is UNIONed on top of the shell (overflow failsafe), then a
+#    narrower bore is DRILLED down through it into the cavity so it never blocks
+#    the hollow -- you pour into the bore and overflow stays in the reservoir.
 # ----------------------------------------------------------------------------
 if POUR_MODE == "top" and high_pts:
-    top_z = world_bbox(body)[1].z + 1.0
-    sp = high_pts[0]                            # cavity apex -> sprue
-    throat_z = sp.z - 1.5                       # punch slightly into the cavity
-    boolean(body, make_cone("sprue",
-                            Vector((sp.x, sp.y, (top_z + throat_z) / 2)),
-                            SPRUE_THROAT_R, SPRUE_TOP_R, top_z - throat_z), 'DIFFERENCE')
-    log(f"sprue @ ({sp.x:.0f},{sp.y:.0f},{sp.z:.0f})")
+    sp = high_pts[0]                            # cavity apex = natural pour/vent point
+    res_top = sp.z + POUR_RES_H                 # reservoir rises above the shell roof
+    post_bot = sp.z + 0.5                       # post sits in the roof, not in the cavity
+    boolean(body, make_cyl("res", Vector((sp.x, sp.y, (res_top + post_bot) / 2)),
+                           POUR_R, res_top - post_bot), 'UNION')        # reservoir post
+    bore_bot = sp.z - 3.0                        # punch through roof into the cavity
+    boolean(body, make_cyl("bore", Vector((sp.x, sp.y, (res_top + 1 + bore_bot) / 2)),
+                           POUR_BORE, (res_top + 1) - bore_bot), 'DIFFERENCE')  # open bore
+    log(f"pour reservoir @ ({sp.x:.0f},{sp.y:.0f})  R{POUR_R}/bore{POUR_BORE}/h{POUR_RES_H}")
 
 # ----------------------------------------------------------------------------
 # 6. base cradle (separate STL): centre pocket = base MODEL, outer recess =
@@ -397,7 +408,7 @@ def halfspace(name, axis, keep_low):
 
 def cut(piece, cutters):
     for cb in cutters:
-        boolean(piece, cb, 'INTERSECT')
+        boolean(piece, cb, 'INTERSECT')   # body is a clean manifold now -> EXACT is fine
     return piece
 
 # ball-key registration. Keys sit on the parting plane(s), seated just inside

@@ -89,36 +89,53 @@ CLI flags: `--four/--two`, `--noflange`, `--nopins`, `--pins-n N`, `--pin R`,
 
 - **Offsets must be constant-distance (Minkowski-sum-with-sphere)**, NOT scale. Implemented
   as **stepped dilation**: displace verts along normals by a small step, voxel-remesh, repeat.
-  A single big vertex-normal push self-intersects → remesh returns garbage (body collapsed to
-  ~100 tris). Small steps avoid the tangle. `offset_solid()` does this.
+  A single big vertex-normal push self-intersects → remesh returns garbage. `offset_solid()` does this.
+- **Shell offset = `CORE_OFFSET + SHELL_OFFSET`** (var `WALL_OUT`). The wall must be measured
+  from the CAVITY surface (model+gap), not the model — else the wall comes out only
+  `SHELL_OFFSET − CORE_OFFSET` thin and collapses.
+- **Voxel size is CAPPED at 0.5mm** (`vs = min(diag/VOXEL_DETAIL, 0.5)`). This is critical:
+  coarser voxels (e.g. 0.84mm auto for a ~185mm-tall model) make the **EXACT booleans silently
+  return empty** — the cavity carve collapses the body to ~40 tris and all 4 pieces come out
+  empty (the "irregular shapes break" bug). 0.5mm works, 0.6mm already fails. Big models are
+  therefore heavier (tesla bust → ~480k-tri body, 11MB pieces) but correct.
 - **`make_box` bakes ALL transforms (incl. location).** Leaving location un-applied makes the
-  EXACT boolean solver silently return empty when the box is large / far from origin.
-- **EXACT boolean can fail on small, heavily-remeshed meshes** (e.g. the old core cut) even when
-  geometry is valid — a `bmesh.ops.bisect_plane` + `holes_fill` was the workaround there.
-- **Cradle ridge = the silicone gap seal.** Its width ≈ `CORE_OFFSET − 2·CRADLE_TOL`; keep
+  EXACT solver silently return empty when the box is large / far from origin.
+- `boolean()` takes a `solver=` arg ('EXACT' default, 'FAST' available). FAST is more tolerant
+  of messy meshes but leaves non-manifold output, so we keep EXACT everywhere + the voxel cap.
+- **Cradle ridge = the silicone gap seal.** Width ≈ `CORE_OFFSET − 2·CRADLE_TOL`; keep
   `CORE_OFFSET > 2·CRADLE_TOL` or the ridge vanishes.
 - Render-to-PNG with `BLENDER_WORKBENCH` + MATCAP was the verification method (scratchpad scripts).
+  Verified on `bun.stl` (small, symmetric) and `tesla.stl` (tall irregular bust).
+
+## Pour reservoir (replaced the old cone sprue)
+
+At the cavity apex (highest point, found by ray-cast), a solid **cylinder post** is unioned on
+top of the shell as an **overflow reservoir**, then a narrower **bore** is drilled down through
+it into the cavity so it never plugs the hollow. `POUR_R` (post radius), `POUR_BORE` (channel),
+`POUR_RES_H` (height above roof). `--pour bottom` skips it.
 
 ## Current status
 
-- **Uncommitted:** the silicone-volume report fix (reports the GAP volume in ml, not the whole
-  cavity). Trivial, kept on purpose. Everything else is at commit `675d9fa`.
-- **Prototyped then DISCARDED** (judged "too much work for little"): a rotational lock peg
-  between cradle and one shell piece, and embossed piece-number + FRONT labels. If revisited,
-  the tricky parts were: thin/curved faces have no good flat spot for text, and the lock socket
-  in a 4.2mm wall is tight.
+All committed up to the matrix-mould rework + handoff. This session's changes (commit them):
+- silicone-volume report (gap volume in ml)
+- pour **reservoir** cylinder (replaced cone sprue)
+- **wall offset fix** (`WALL_OUT = CORE_OFFSET + SHELL_OFFSET`)
+- **voxel cap at 0.5mm** → fixes empty pieces on big / irregular models
+
+DISCARDED earlier (too much work for little): rotational lock peg + embossed labels.
 
 ## Ideas / backlog (not built)
 
-1. silicone-volume report — **DONE (this is the kept change)**
-2. rotational lock peg — *discarded*
-3. part labels / FRONT arrow — *discarded*
-4. auto-orient model (flattest face down) before moulding
-5. auto parting axis (split along widest girth instead of world X/Y) to ease release
-6. config presets (JSON profiles) instead of editing the script
-7. manifold-cleanup pass to guarantee watertight pieces (they have some non-manifold edges)
-8. undercut warning for the chosen parting planes
-9. Blender addon GUI (sliders + button) instead of CLI
+1. silicone-volume report — **DONE**
+2. irregular-shape pieces breaking — **FIXED (voxel cap)**
+3. rotational lock peg — *discarded*
+4. part labels / FRONT arrow — *discarded*
+5. auto-orient model (flattest face down) before moulding
+6. auto parting axis (split along widest girth instead of world X/Y) to ease release
+7. config presets (JSON profiles) instead of editing the script
+8. manifold-cleanup pass to guarantee watertight pieces
+9. adaptive voxel: only go fine where needed (speed up big models)
+10. Blender addon GUI (sliders + button) instead of CLI
 
 ## Environment notes
 
