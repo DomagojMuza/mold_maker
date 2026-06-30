@@ -319,9 +319,8 @@ else:
 negative = offset_solid(master, CORE_OFFSET, vs, "negative") if CORE_OFFSET > 1e-6 \
            else dup(master, "negative")
 neg_mn, neg_mx = world_bbox(negative)
-cavity_vol = mesh_volume(negative)
-log(f"cavity volume ~ {cavity_vol/1000:.1f} cm3 -> ~{cavity_vol/1000:.1f} ml of cast material")
-log(f"mould wall = {SHELL_OFFSET}mm  (cavity clearance {CORE_OFFSET}mm)")
+gap_vol = mesh_volume(negative) - mesh_volume(master)   # silicone fills only the gap
+log(f"silicone needed ~ {gap_vol/1000:.1f} ml  (gap {CORE_OFFSET}mm, shell wall {SHELL_OFFSET}mm)")
 
 # sample cavity high points (ray straight down onto the negative) for sprue+vents
 high_pts = []
