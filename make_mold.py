@@ -299,16 +299,22 @@ outer = offset_solid(master, WALL_OUT, vs, "outer")
 
 if ADD_FLANGE:
     flangeblob = offset_solid(master, WALL_OUT + FLANGE_REACH, vs, "flangeblob")
+    # cap the flange at the shell top so it stays a radial lip and never towers
+    # over the pour reservoir (which sits at the apex and rises above the shell).
+    flange_top = world_bbox(outer)[1].z
+    z_lo = mn.z - WALL_OUT - 10.0
+    z_c, z_h = (z_lo + flange_top) / 2, (flange_top - z_lo)
 
     def flange_band(normal_axis):
-        """slab thin along normal_axis, centred on parting plane, clipped to flangeblob."""
+        """slab thin along normal_axis, centred on the parting plane, capped in Z
+        at the shell top, clipped to flangeblob."""
         if normal_axis == 'Y':
-            dims = (span, FLANGE_THICK, span)
+            dims = (span, FLANGE_THICK, z_h)
         else:  # 'X'
-            dims = (FLANGE_THICK, span, span)
-        slab = make_box(f"slab_{normal_axis}", center, dims)
+            dims = (FLANGE_THICK, span, z_h)
+        slab = make_box(f"slab_{normal_axis}", Vector((center.x, center.y, z_c)), dims)
         band = dup(flangeblob, f"band_{normal_axis}")
-        boolean(band, slab, 'INTERSECT')        # band = flangeblob ∩ slab
+        boolean(band, slab, 'INTERSECT')        # band = flangeblob ∩ capped slab
         return band
 
     boolean(outer, flange_band('Y'), 'UNION')

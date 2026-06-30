@@ -114,6 +114,10 @@ top of the shell as an **overflow reservoir**, then a narrower **bore** is drill
 it into the cavity so it never plugs the hollow. `POUR_R` (post radius), `POUR_BORE` (channel),
 `POUR_RES_H` (height above roof). `--pour bottom` skips it.
 
+The **flange is capped in Z at the shell top** (`flange_top = outer top`); otherwise the flange
+(built from a bigger offset `+FLANGE_REACH`) towers above the shell and blocks the pour mouth
+at the apex. The lip still sticks out radially for clamping — it just doesn't rise above.
+
 ## Current status
 
 All committed up to the matrix-mould rework + handoff. This session's changes (commit them):
