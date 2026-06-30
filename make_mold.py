@@ -10,7 +10,7 @@ Pipeline (no clicking):
   1. import master mesh (STL)
   2. decimate to target poly budget (skips if already low)
   3. clean / make manifold via voxel remesh
-  4. build OUTER solid  = model offset OUT by SHELL_OFFSET   (the shell wall)
+  4. build OUTER solid  = model offset OUT by SHELL_OFFSET  (wall = SHELL_OFFSET - CORE_OFFSET)
   5. build FLANGE blob  = model offset OUT by SHELL_OFFSET+FLANGE_REACH
         -> intersect a thin vertical slab (FLANGE_THICK) on the parting plane(s)
   6. shell body = OUTER (union flange band(s)) MINUS the NEGATIVE (model+gap)
@@ -43,9 +43,10 @@ from mathutils import Vector
 # ----------------------------------------------------------------------------
 # CONFIG (defaults -- override some via CLI)
 # ----------------------------------------------------------------------------
-SHELL_OFFSET  = 4.2    # mm, mould wall thickness (model offset OUT -> shell)
-CORE_OFFSET   = 3.0    # mm, cavity clearance: cavity = model grown by this
-                       #   (0 = exact model -> solid cast; >0 = looser cavity)
+SHELL_OFFSET  = 4.2    # mm, how far the outer shell surface sits from the model.
+                       #   wall thickness = SHELL_OFFSET - CORE_OFFSET  (must be > CORE_OFFSET)
+CORE_OFFSET   = 3.0    # mm, silicone gap: cavity = model grown by this amount
+                       #   (0 = exact model -> solid cast; >0 = silicone layer)
 FLANGE_REACH  = 10.0   # mm, how far flange lip sticks out past the shell
 FLANGE_THICK  = 6.0    # mm, thickness of the flange slab (clamp meat)
 BASE_CUT      = None   # mm up from the lowest point to slice a FLAT bottom
@@ -66,6 +67,19 @@ POUR_MODE     = "top"  # "top" = add a pour reservoir on top
 POUR_R        = 6.0    # mm, reservoir post outer radius (overflow cup wall)
 POUR_BORE     = 3.0    # mm, pour channel / overflow bore radius
 POUR_RES_H    = 12.0   # mm, reservoir height above the shell roof
+FUNNEL_TOP_R  = None   # mm, flared mouth radius at the very top of the bore (easier aim,
+                       #   less spill). None -> auto = POUR_R - 1.0 (leaves a thin rim)
+FUNNEL_H      = 6.0    # mm, height of the funnel taper, measured down from the reservoir top
+
+# air vents: small posts at secondary cavity high points, so trapped air has somewhere
+# to go besides the pour hole. Each vent is its own mini reservoir (post + bore), raised
+# to the SAME top height as the main pour post -- the bore itself stays narrow on purpose,
+# meant to bleed air, not become a second pour point; a little weeping signals "cavity full".
+ADD_VENTS     = True
+VENT_BORE     = 1.0    # mm, vent bore radius (small on purpose)
+VENT_POST_R   = 2.5    # mm, vent post outer radius (thin wall around the small bore)
+VENT_MIN_SEP  = 25.0   # mm, min XY distance a vent must keep from the pour point + other vents
+VENT_MAX_N    = 3      # max number of vent holes added
 
 # base cradle: locates the base MODEL (centre pocket) AND the mould shell (outer
 # recess); the thin ridge between them seals the silicone gap at the bottom.
@@ -237,6 +251,11 @@ while i < len(argv):
     elif a == "--pin":      PIN_RADIUS = float(argv[i+1]); i += 1
     elif a == "--pins-n":   PIN_COUNT = int(argv[i+1]); i += 1
     elif a == "--pour":     POUR_MODE = argv[i+1]; i += 1   # "top" | "bottom"
+    elif a == "--funnel":   FUNNEL_TOP_R = float(argv[i+1]); i += 1
+    elif a == "--novents":  ADD_VENTS = False
+    elif a == "--vent":     VENT_BORE = float(argv[i+1]); i += 1
+    elif a == "--vent-post":VENT_POST_R = float(argv[i+1]); i += 1
+    elif a == "--vent-n":   VENT_MAX_N = int(argv[i+1]); i += 1
     elif a == "--nocradle": ADD_CRADLE = False
     elif not a.startswith("--"): outdir = os.path.abspath(a)
     i += 1
@@ -312,10 +331,10 @@ def main():
 
     # ------------------------------------------------------------------------
     # 3. OUTER shell solid + optional FLANGE band(s)
-    #    OUTER = model + cavity gap + wall, so the shell wall ends up SHELL_OFFSET
-    #    thick AROUND the cavity (cavity = model + CORE_OFFSET).
+    #    OUTER = model + SHELL_OFFSET.  wall thickness = SHELL_OFFSET - CORE_OFFSET.
+    #    Requires SHELL_OFFSET > CORE_OFFSET (or outer collapses inside negative).
     # ------------------------------------------------------------------------
-    WALL_OUT = CORE_OFFSET + SHELL_OFFSET
+    WALL_OUT = SHELL_OFFSET
     outer = offset_solid(master, WALL_OUT, vs, "outer")
 
     if ADD_FLANGE:
@@ -396,10 +415,49 @@ def main():
         post_bot = sp.z + 0.5                       # post sits in the roof, not in the cavity
         boolean(body, make_cyl("res", Vector((sp.x, sp.y, (res_top + post_bot) / 2)),
                                POUR_R, res_top - post_bot), 'UNION')        # reservoir post
+
+        # funnel mouth: wide flared cone at the very top, tapers down to bore radius --
+        # easier to aim a pour stream into, less spillage than a flush cylindrical hole.
+        funnel_top_r = min(FUNNEL_TOP_R if FUNNEL_TOP_R is not None else POUR_R - 1.0, POUR_R - 1.0)
+        funnel_h = min(FUNNEL_H, POUR_RES_H - 1.0)
+        funnel_top_z = res_top + 1.0
+        funnel_bot_z = res_top - funnel_h
+        boolean(body, make_cone("funnel", Vector((sp.x, sp.y, (funnel_top_z + funnel_bot_z) / 2)),
+                                POUR_BORE, funnel_top_r, funnel_top_z - funnel_bot_z), 'DIFFERENCE')
+
         bore_bot = sp.z - 3.0                        # punch through roof into the cavity
-        boolean(body, make_cyl("bore", Vector((sp.x, sp.y, (res_top + 1 + bore_bot) / 2)),
-                               POUR_BORE, (res_top + 1) - bore_bot), 'DIFFERENCE')  # open bore
-        log(f"pour reservoir @ ({sp.x:.0f},{sp.y:.0f})  R{POUR_R}/bore{POUR_BORE}/h{POUR_RES_H}")
+        bore_top = funnel_bot_z + 0.5                # overlaps funnel base, no gap between cuts
+        boolean(body, make_cyl("bore", Vector((sp.x, sp.y, (bore_top + bore_bot) / 2)),
+                               POUR_BORE, bore_top - bore_bot), 'DIFFERENCE')  # open bore
+        log(f"pour reservoir @ ({sp.x:.0f},{sp.y:.0f})  R{POUR_R}/bore{POUR_BORE}/h{POUR_RES_H}"
+            f"  funnel R{funnel_top_r:.1f}/h{funnel_h:.1f}")
+
+        # air vents: small posts (mini pour holes) at secondary cavity high points, so
+        # trapped air has somewhere to escape besides the pour hole. Each vent post is
+        # raised to the SAME top height as the main reservoir (res_top) -- otherwise its
+        # opening sits lower than the pour level and can't vent once silicone covers it.
+        # The bore through it stays narrow on purpose -- bleeds air, doesn't become a
+        # second pour point that wastes silicone.
+        if ADD_VENTS:
+            vent_pts = []
+            for vp in high_pts[1:]:
+                if (vp.xy - sp.xy).length < VENT_MIN_SEP:
+                    continue
+                if any((vp.xy - q.xy).length < VENT_MIN_SEP for q in vent_pts):
+                    continue
+                vent_pts.append(vp)
+                if len(vent_pts) >= VENT_MAX_N:
+                    break
+            for vp in vent_pts:
+                vpost_bot = vp.z + 0.5                   # post sits in the roof, not in the cavity
+                boolean(body, make_cyl("ventpost", Vector((vp.x, vp.y, (res_top + vpost_bot) / 2)),
+                                       VENT_POST_R, res_top - vpost_bot), 'UNION')   # vent post
+                vbore_bot = vp.z - 2.0                    # punch through roof into the cavity
+                boolean(body, make_cyl("ventbore", Vector((vp.x, vp.y, (res_top + 1 + vbore_bot) / 2)),
+                                       VENT_BORE, (res_top + 1) - vbore_bot), 'DIFFERENCE')  # air bore
+            if vent_pts:
+                log(f"air vents: {len(vent_pts)} @ post R{VENT_POST_R}/bore R{VENT_BORE}mm, "
+                    f"top matched to pour (z={res_top:.1f})")
 
     # ------------------------------------------------------------------------
     # 6. base cradle (separate STL): centre pocket = base MODEL, outer recess =

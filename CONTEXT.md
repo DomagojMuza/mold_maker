@@ -118,6 +118,14 @@ The **flange is capped in Z at the shell top** (`flange_top = outer top`); other
 (built from a bigger offset `+FLANGE_REACH`) towers above the shell and blocks the pour mouth
 at the apex. The lip still sticks out radially for clamping — it just doesn't rise above.
 
+**Funnel mouth + air vents** (added on top of the reservoir): the bore's top is cut with a cone
+(`make_cone`), wide mouth (`FUNNEL_TOP_R`, auto `POUR_R-1.0`) tapering to `POUR_BORE` over
+`FUNNEL_H` (6mm), so pouring is easier to aim. Up to `VENT_MAX_N` (3) extra **small** straight
+bores (`VENT_BORE`, 1mm — deliberately narrow, NOT reservoirs) are drilled at secondary cavity
+high points (`high_pts[1:]`, greedy-filtered ≥`VENT_MIN_SEP`=25mm apart) so trapped air has
+somewhere to bleed besides the main pour hole, without leaking/wasting silicone. `--novents` to
+disable, `--vent N` / `--vent-n N` to tune. `--funnel N` overrides the mouth radius.
+
 ## Current status
 
 All committed up to the matrix-mould rework + handoff. This session's changes (commit them):
@@ -125,6 +133,8 @@ All committed up to the matrix-mould rework + handoff. This session's changes (c
 - pour **reservoir** cylinder (replaced cone sprue)
 - **wall offset fix** (`WALL_OUT = CORE_OFFSET + SHELL_OFFSET`)
 - **voxel cap at 0.5mm** → fixes empty pieces on big / irregular models
+- **Blender 5.x fix**: `cut()` uses `solver='MANIFOLD'` (EXACT silently emptied 2nd INTERSECT)
+- **funnel mouth + air vents** on the pour inlet (see "Pour reservoir" section above)
 
 DISCARDED earlier (too much work for little): rotational lock peg + embossed labels.
 
