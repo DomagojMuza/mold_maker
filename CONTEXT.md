@@ -143,6 +143,12 @@ DISCARDED earlier (too much work for little): rotational lock peg + embossed lab
 
 ## Environment notes
 
-- Blender 4.3.2. Script targets 4.x API (`wm.stl_import` / `wm.stl_export`) with legacy fallback.
+- Blender 5.1 (also has 3.6). Script targets 4.5+ API. All core operators still present in 5.1.
+- **Blender 5.x boolean change**: `cut()` now uses `solver='MANIFOLD'`. The EXACT solver silently
+  returns an empty mesh on the **second sequential INTERSECT** in 4-piece mode — xl_yl piece came
+  out as 84 bytes (0 tris). Root cause: after the first halfspace INTERSECT, the mesh state causes
+  EXACT to fail silently. MANIFOLD (added in 4.5 LTS) handles it correctly and is also faster.
+- **Boolean solver enum changed** in 5.0: `'FAST'` → `'FLOAT'`. `'EXACT'` still exists. `'MANIFOLD'`
+  added in 4.5. Script only uses EXACT (unchanged) + MANIFOLD for cuts (new).
 - Git push uses Git Credential Manager: `git config --global credential.helper manager`
   (VS Code's GIT_ASKPASS was broken — "Permission denied" — bypassed by GCM).

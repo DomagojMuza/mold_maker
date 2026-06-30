@@ -25,6 +25,11 @@ Pipeline (no clicking):
 Run:
   blender --background --python make_mold.py -- input.stl [outdir] [--four] [--voxel 0.6] [--target 6000]
 
+  Also runs fine WITHOUT --background (GUI preview): the whole pipeline is
+  deferred to a bpy.app.timers callback so it executes after Blender's event
+  loop is up, avoiding "context is incorrect" errors from running scene/window
+  operators during early --python startup.
+
 Notes:
   * split planes are VERTICAL (contain Z), centred on the bounding box.
   * --four  = two flanges 90deg apart -> 4-piece mould (default).
@@ -75,6 +80,14 @@ CRADLE_TOL    = 0.5    # mm, pocket oversize (fit + base-material expansion)
 # small helpers
 # ----------------------------------------------------------------------------
 def log(msg): print(f"[mould] {msg}")
+
+def _gui_win():
+    """Window context override for GUI mode -- read_factory_settings leaves
+    context windowless so file-I/O operators fail their poll() check."""
+    if bpy.app.background:
+        return {}
+    wm = bpy.context.window_manager
+    return {"window": wm.windows[0]} if wm.windows else {}
 
 def activate(obj):
     try: bpy.ops.object.mode_set(mode='OBJECT')
@@ -131,7 +144,9 @@ def offset_solid(base, dist, vs, name):
     return o
 
 def boolean(a, b, op, keep_b=False, solver='EXACT'):
-    """a = a <op> b   (op: 'UNION' | 'DIFFERENCE' | 'INTERSECT')."""
+    """a = a <op> b   (op: 'UNION' | 'DIFFERENCE' | 'INTERSECT').
+    solver: 'EXACT' (default), 'MANIFOLD' (fast, requires manifold inputs, 4.5+),
+            'FLOAT' (was 'FAST' pre-5.0, tolerant but non-manifold output)."""
     m = a.modifiers.new("bool", 'BOOLEAN')
     m.operation = op
     m.solver = solver
@@ -188,14 +203,15 @@ def mesh_volume(obj):
 
 def export_stl(obj, path):
     activate(obj)
-    try:
-        bpy.ops.wm.stl_export(filepath=path, export_selected_objects=True)   # Blender 4.x
-    except AttributeError:
-        bpy.ops.export_mesh.stl(filepath=path, use_selection=True)           # legacy
+    with bpy.context.temp_override(**_gui_win()):
+        try:
+            bpy.ops.wm.stl_export(filepath=path, export_selected_objects=True)   # Blender 4.x
+        except AttributeError:
+            bpy.ops.export_mesh.stl(filepath=path, use_selection=True)           # legacy
     log(f"wrote {path}")
 
 # ----------------------------------------------------------------------------
-# argument parsing (after the "--")
+# argument parsing (after the "--") -- runs at import time, no bpy context needed
 # ----------------------------------------------------------------------------
 argv = sys.argv[sys.argv.index("--")+1:] if "--" in sys.argv else []
 if not argv:
@@ -228,268 +244,292 @@ os.makedirs(outdir, exist_ok=True)
 stem = os.path.splitext(os.path.basename(in_path))[0]
 
 # ----------------------------------------------------------------------------
-# 0. fresh scene + import
+# main pipeline -- deferred to a timer in GUI mode (see bottom of file)
 # ----------------------------------------------------------------------------
-bpy.ops.wm.read_factory_settings(use_empty=True)
-log(f"import {in_path}")
-try:
-    bpy.ops.wm.stl_import(filepath=in_path)         # Blender 4.x
-except AttributeError:
-    bpy.ops.import_mesh.stl(filepath=in_path)       # legacy
+def main():
+    # ------------------------------------------------------------------------
+    # 0. fresh scene + import
+    # ------------------------------------------------------------------------
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    log(f"import {in_path}")
+    with bpy.context.temp_override(**_gui_win()):
+        try:
+            bpy.ops.wm.stl_import(filepath=in_path)         # Blender 4.x
+        except AttributeError:
+            bpy.ops.import_mesh.stl(filepath=in_path)       # legacy
 
-# join everything that came in, bake transforms
-meshes = [o for o in bpy.context.scene.objects if o.type == 'MESH']
-activate(meshes[0])
-for o in meshes: o.select_set(True)
-if len(meshes) > 1:
-    bpy.ops.object.join()
-master = bpy.context.active_object
-master.name = "master"
-bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+    # join everything that came in, bake transforms
+    meshes = [o for o in bpy.context.scene.objects if o.type == 'MESH']
+    activate(meshes[0])
+    for o in meshes: o.select_set(True)
+    if len(meshes) > 1:
+        bpy.ops.object.join()
+    master = bpy.context.active_object
+    master.name = "master"
+    bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
 
-# ----------------------------------------------------------------------------
-# 1. decimate to poly budget
-# ----------------------------------------------------------------------------
-ntri = len(master.data.polygons)
-if ntri > DECIMATE_TGT:
-    m = master.modifiers.new("dec", 'DECIMATE')
-    m.ratio = DECIMATE_TGT / ntri
-    apply_mod(master, m.name)
-    log(f"decimate {ntri} -> {len(master.data.polygons)} tris")
-else:
-    log(f"skip decimate ({ntri} tris already <= {DECIMATE_TGT})")
-
-# ----------------------------------------------------------------------------
-# 2. geometry params from bbox
-# ----------------------------------------------------------------------------
-mn, mx = world_bbox(master)
-center = (mn + mx) * 0.5
-size   = mx - mn
-maxdim = max(size.x, size.y, size.z)
-diag   = size.length
-span   = maxdim * 4.0                       # big enough to cover everything
-# voxel size: auto from bbox, but CAPPED at 0.5mm -- coarser than that makes the
-# EXACT booleans fail (the offset surfaces under-resolve and the carve collapses).
-vs     = VOXEL_SIZE if VOXEL_SIZE else min(max(diag / VOXEL_DETAIL, 0.25), 0.5)
-log(f"bbox {tuple(round(v,1) for v in size)}  voxel={vs:.3f}mm")
-
-cutz = None   # flat-bottom cut height, decided after the cavity is built (pour mode)
-
-def cut_bottom_box(obj):
-    """Flat bottom via boolean intersect with a half-space box (caps the ring
-    cross-section of the hollow mould body and gives a flat foot + pour mouth)."""
-    if cutz is None:
-        return
-    h = (mx.z + maxdim) - cutz                          # tight box just above the part
-    keep = make_box(obj.name + "_keep",
-                    Vector((center.x, center.y, cutz + h / 2)),
-                    (4 * maxdim, 4 * maxdim, h))
-    boolean(obj, keep, 'INTERSECT')
-
-# heal the master itself so booleans are robust
-voxel_remesh(master, vs)
-
-# ----------------------------------------------------------------------------
-# 3. OUTER shell solid + optional FLANGE band(s)
-#    OUTER = model + cavity gap + wall, so the shell wall ends up SHELL_OFFSET
-#    thick AROUND the cavity (cavity = model + CORE_OFFSET).
-# ----------------------------------------------------------------------------
-WALL_OUT = CORE_OFFSET + SHELL_OFFSET
-outer = offset_solid(master, WALL_OUT, vs, "outer")
-
-if ADD_FLANGE:
-    flangeblob = offset_solid(master, WALL_OUT + FLANGE_REACH, vs, "flangeblob")
-    # cap the flange at the shell top so it stays a radial lip and never towers
-    # over the pour reservoir (which sits at the apex and rises above the shell).
-    flange_top = world_bbox(outer)[1].z
-    z_lo = mn.z - WALL_OUT - 10.0
-    z_c, z_h = (z_lo + flange_top) / 2, (flange_top - z_lo)
-
-    def flange_band(normal_axis):
-        """slab thin along normal_axis, centred on the parting plane, capped in Z
-        at the shell top, clipped to flangeblob."""
-        if normal_axis == 'Y':
-            dims = (span, FLANGE_THICK, z_h)
-        else:  # 'X'
-            dims = (FLANGE_THICK, span, z_h)
-        slab = make_box(f"slab_{normal_axis}", Vector((center.x, center.y, z_c)), dims)
-        band = dup(flangeblob, f"band_{normal_axis}")
-        boolean(band, slab, 'INTERSECT')        # band = flangeblob ∩ capped slab
-        return band
-
-    boolean(outer, flange_band('Y'), 'UNION')
-    if FOUR_PIECE:
-        boolean(outer, flange_band('X'), 'UNION')
-    rm(flangeblob)
-    log("flange: ON")
-else:
-    log("flange: OFF (bare split)")
-
-# ----------------------------------------------------------------------------
-# 4. carve the pour cavity (NEGATIVE cuts the cavity out of the shell)
-# ----------------------------------------------------------------------------
-negative = offset_solid(master, CORE_OFFSET, vs, "negative") if CORE_OFFSET > 1e-6 \
-           else dup(master, "negative")
-neg_mn, neg_mx = world_bbox(negative)
-gap_vol = mesh_volume(negative) - mesh_volume(master)   # silicone fills only the gap
-log(f"silicone needed ~ {gap_vol/1000:.1f} ml  (gap {CORE_OFFSET}mm, shell wall {SHELL_OFFSET}mm)")
-
-# sample cavity high points (ray straight down onto the negative) for sprue+vents
-high_pts = []
-if POUR_MODE == "top":
-    g = 18
-    for ix in range(g):
-        for iy in range(g):
-            x = neg_mn.x + (neg_mx.x - neg_mn.x) * (ix + 0.5) / g
-            y = neg_mn.y + (neg_mx.y - neg_mn.y) * (iy + 0.5) / g
-            hit = ray_edge(negative, (x, y, neg_mx.z + span), (0, 0, -1))
-            if hit:
-                high_pts.append(hit)
-    high_pts.sort(key=lambda p: -p.z)
-
-boolean(outer, negative, 'DIFFERENCE')         # negative consumed
-body = outer
-body.name = "mould_body"
-
-# ----------------------------------------------------------------------------
-# flat-bottom cut: bottom is ALWAYS open (the cradle is the floor). Cut at the
-# model bottom so the cavity opens there and the model can seat in the cradle.
-# ----------------------------------------------------------------------------
-if BASE_CUT is not None and BASE_CUT < 0:
-    cutz = None                                 # --nobase: no cut
-else:
-    cutz = mn.z + (BASE_CUT or 0.0)
-if cutz is not None:
-    log(f"flat bottom cut (open) @ z={cutz:.2f}")
-cut_bottom_box(body)
-
-# ----------------------------------------------------------------------------
-# 5. pour inlet: reservoir post at the pour point (= cavity apex / highest point).
-#    A solid cylinder is UNIONed on top of the shell (overflow failsafe), then a
-#    narrower bore is DRILLED down through it into the cavity so it never blocks
-#    the hollow -- you pour into the bore and overflow stays in the reservoir.
-# ----------------------------------------------------------------------------
-if POUR_MODE == "top" and high_pts:
-    sp = high_pts[0]                            # cavity apex = natural pour/vent point
-    res_top = sp.z + POUR_RES_H                 # reservoir rises above the shell roof
-    post_bot = sp.z + 0.5                       # post sits in the roof, not in the cavity
-    boolean(body, make_cyl("res", Vector((sp.x, sp.y, (res_top + post_bot) / 2)),
-                           POUR_R, res_top - post_bot), 'UNION')        # reservoir post
-    bore_bot = sp.z - 3.0                        # punch through roof into the cavity
-    boolean(body, make_cyl("bore", Vector((sp.x, sp.y, (res_top + 1 + bore_bot) / 2)),
-                           POUR_BORE, (res_top + 1) - bore_bot), 'DIFFERENCE')  # open bore
-    log(f"pour reservoir @ ({sp.x:.0f},{sp.y:.0f})  R{POUR_R}/bore{POUR_BORE}/h{POUR_RES_H}")
-
-# ----------------------------------------------------------------------------
-# 6. base cradle (separate STL): centre pocket = base MODEL, outer recess =
-#    mould SHELL. The ridge between them (= the silicone gap) seals the bottom.
-#    Both pockets oversized by CRADLE_TOL for fit + base-material expansion.
-# ----------------------------------------------------------------------------
-if ADD_CRADLE and cutz is not None:
-    shell_cut = offset_solid(body,   CRADLE_TOL, vs, "cr_shell")   # mould footprint + tol
-    model_cut = offset_solid(master, CRADLE_TOL, vs, "cr_model")   # base model + tol
-    smn, smx = world_bbox(shell_cut)
-    rim_z, bot_z = cutz + CRADLE_RECESS, cutz - CRADLE_FLOOR
-    plate = make_box("cradle",
-                     Vector((center.x, center.y, (rim_z + bot_z) / 2)),
-                     ((smx.x - smn.x) + 2 * CRADLE_WALL,
-                      (smx.y - smn.y) + 2 * CRADLE_WALL, rim_z - bot_z))
-    boolean(plate, shell_cut, 'DIFFERENCE')     # outer recess -> locates the shell
-    boolean(plate, model_cut, 'DIFFERENCE')     # centre pocket -> locates the model
-    export_stl(plate, os.path.join(outdir, f"{stem}_cradle.stl"))
-    rm(plate)
-    log(f"cradle: model pocket + shell recess (tol {CRADLE_TOL}mm)")
-
-# ----------------------------------------------------------------------------
-# 7. split into pieces with vertical half-space boxes (+ ball keys)
-# ----------------------------------------------------------------------------
-def halfspace(name, axis, keep_low):
-    """box occupying the keep side of the parting plane on the given axis."""
-    c = list(center)
-    d = list((2*span, 2*span, 2*span))
-    ai = 0 if axis == 'X' else 1
-    d[ai] = span
-    c[ai] = (center[ai] - span/2) if keep_low else (center[ai] + span/2)
-    return make_box(name, Vector(c), d)
-
-def cut(piece, cutters):
-    for cb in cutters:
-        boolean(piece, cb, 'INTERSECT')   # body is a clean manifold now -> EXACT is fine
-    return piece
-
-# ball-key registration. Keys sit on the parting plane(s), seated just inside
-# the ACTUAL flange edge (found by ray-cast, so they hug the silhouette and
-# never float). Convention: +side of a plane = male ball, -side = socket.
-keys_on = ADD_PINS and ADD_FLANGE
-inset = PIN_RADIUS + 2.0                              # seat the ball this far in from the lip edge
-
-# pin heights: spread N keys up the parting line (15%..85% of model height).
-# N auto-scales at ~1 per 40mm of height.
-n_pins = PIN_COUNT if PIN_COUNT else max(1, int(size.z / 40) + 1)
-if n_pins == 1:
-    pin_zs = [center.z]
-else:
-    zlo, zhi = mn.z + 0.15 * size.z, mn.z + 0.85 * size.z
-    pin_zs = [zlo + (zhi - zlo) * k / (n_pins - 1) for k in range(n_pins)]
-if keys_on:
-    log(f"pins: up to {n_pins} per interface")
-
-def lip(plus, along, pz):
-    """find pin coord on axis `along` ('x'/'y') just inside the flange edge,
-    at height pz, on the +side (plus=True) or -side. None if no flange there."""
-    o = list(center); d = [0.0, 0.0, 0.0]; ax = 0 if along == 'x' else 1
-    o[2] = pz
-    o[ax] = (center[ax] + span) if plus else (center[ax] - span)
-    d[ax] = -1.0 if plus else 1.0
-    e = ray_edge(body, o, d)
-    if e is None:
-        return None
-    return (e[ax] - inset) if plus else (e[ax] + inset)
-
-def key(piece, point, male):
-    """add a ball boss (male) or socket (female) to a piece at point."""
-    if male:
-        boolean(piece, make_ball(f"{piece.name}_m", point, PIN_RADIUS), 'UNION')
+    # ------------------------------------------------------------------------
+    # 1. decimate to poly budget
+    # ------------------------------------------------------------------------
+    ntri = len(master.data.polygons)
+    if ntri > DECIMATE_TGT:
+        m = master.modifiers.new("dec", 'DECIMATE')
+        m.ratio = DECIMATE_TGT / ntri
+        apply_mod(master, m.name)
+        log(f"decimate {ntri} -> {len(master.data.polygons)} tris")
     else:
-        boolean(piece, make_ball(f"{piece.name}_f", point, PIN_RADIUS + PIN_CLEAR), 'DIFFERENCE')
+        log(f"skip decimate ({ntri} tris already <= {DECIMATE_TGT})")
 
-pieces = []
-if FOUR_PIECE:
-    combos = [("xl_yl", True,  True),
-              ("xh_yl", False, True),
-              ("xl_yh", True,  False),
-              ("xh_yh", False, False)]
-    for tag, xlo, ylo in combos:                       # xlo: on -X side, ylo: on -Y side
-        p = dup(body, f"piece_{tag}")
-        cut(p, [halfspace(f"hs1_{tag}", 'X', xlo),
-                halfspace(f"hs2_{tag}", 'Y', ylo)])
-        if keys_on:
-            for pz in pin_zs:
-                px = lip(not xlo, 'x', pz)             # Y-plane key on this piece's X side
-                if px is not None:
-                    key(p, Vector((px, center.y, pz)), male=not ylo)
-                py = lip(not ylo, 'y', pz)             # X-plane key on this piece's Y side
-                if py is not None:
-                    key(p, Vector((center.x, py, pz)), male=not xlo)
-        pieces.append((tag, p))
-    rm(body)
-else:
-    for tag, ylo in (("yl", True), ("yh", False)):
-        p = dup(body, f"piece_{tag}")
-        cut(p, [halfspace(f"hs_{tag}", 'Y', ylo)])
-        if keys_on:
-            for pz in pin_zs:
-                for xplus in (False, True):            # keys at both -X and +X lips
-                    px = lip(xplus, 'x', pz)
+    # ------------------------------------------------------------------------
+    # 2. geometry params from bbox
+    # ------------------------------------------------------------------------
+    mn, mx = world_bbox(master)
+    center = (mn + mx) * 0.5
+    size   = mx - mn
+    maxdim = max(size.x, size.y, size.z)
+    diag   = size.length
+    span   = maxdim * 4.0                       # big enough to cover everything
+    # voxel size: auto from bbox, but CAPPED at 0.5mm -- coarser than that makes the
+    # EXACT booleans fail (the offset surfaces under-resolve and the carve collapses).
+    vs     = VOXEL_SIZE if VOXEL_SIZE else min(max(diag / VOXEL_DETAIL, 0.25), 0.5)
+    log(f"bbox {tuple(round(v,1) for v in size)}  voxel={vs:.3f}mm")
+
+    cutz = None   # flat-bottom cut height, decided after the cavity is built (pour mode)
+
+    def cut_bottom_box(obj):
+        """Flat bottom via boolean intersect with a half-space box (caps the ring
+        cross-section of the hollow mould body and gives a flat foot + pour mouth)."""
+        if cutz is None:
+            return
+        h = (mx.z + maxdim) - cutz                          # tight box just above the part
+        keep = make_box(obj.name + "_keep",
+                        Vector((center.x, center.y, cutz + h / 2)),
+                        (4 * maxdim, 4 * maxdim, h))
+        boolean(obj, keep, 'INTERSECT')
+
+    # heal the master itself so booleans are robust
+    voxel_remesh(master, vs)
+
+    # ------------------------------------------------------------------------
+    # 3. OUTER shell solid + optional FLANGE band(s)
+    #    OUTER = model + cavity gap + wall, so the shell wall ends up SHELL_OFFSET
+    #    thick AROUND the cavity (cavity = model + CORE_OFFSET).
+    # ------------------------------------------------------------------------
+    WALL_OUT = CORE_OFFSET + SHELL_OFFSET
+    outer = offset_solid(master, WALL_OUT, vs, "outer")
+
+    if ADD_FLANGE:
+        flangeblob = offset_solid(master, WALL_OUT + FLANGE_REACH, vs, "flangeblob")
+        # cap the flange at the shell top so it stays a radial lip and never towers
+        # over the pour reservoir (which sits at the apex and rises above the shell).
+        flange_top = world_bbox(outer)[1].z
+        z_lo = mn.z - WALL_OUT - 10.0
+        z_c, z_h = (z_lo + flange_top) / 2, (flange_top - z_lo)
+
+        def flange_band(normal_axis):
+            """slab thin along normal_axis, centred on the parting plane, capped in Z
+            at the shell top, clipped to flangeblob."""
+            if normal_axis == 'Y':
+                dims = (span, FLANGE_THICK, z_h)
+            else:  # 'X'
+                dims = (FLANGE_THICK, span, z_h)
+            slab = make_box(f"slab_{normal_axis}", Vector((center.x, center.y, z_c)), dims)
+            band = dup(flangeblob, f"band_{normal_axis}")
+            boolean(band, slab, 'INTERSECT')        # band = flangeblob ∩ capped slab
+            return band
+
+        boolean(outer, flange_band('Y'), 'UNION')
+        if FOUR_PIECE:
+            boolean(outer, flange_band('X'), 'UNION')
+        rm(flangeblob)
+        log("flange: ON")
+    else:
+        log("flange: OFF (bare split)")
+
+    # ------------------------------------------------------------------------
+    # 4. carve the pour cavity (NEGATIVE cuts the cavity out of the shell)
+    # ------------------------------------------------------------------------
+    negative = offset_solid(master, CORE_OFFSET, vs, "negative") if CORE_OFFSET > 1e-6 \
+               else dup(master, "negative")
+    neg_mn, neg_mx = world_bbox(negative)
+    gap_vol = mesh_volume(negative) - mesh_volume(master)   # silicone fills only the gap
+    log(f"silicone needed ~ {gap_vol/1000:.1f} ml  (gap {CORE_OFFSET}mm, shell wall {SHELL_OFFSET}mm)")
+
+    # sample cavity high points (ray straight down onto the negative) for sprue+vents
+    high_pts = []
+    if POUR_MODE == "top":
+        g = 18
+        for ix in range(g):
+            for iy in range(g):
+                x = neg_mn.x + (neg_mx.x - neg_mn.x) * (ix + 0.5) / g
+                y = neg_mn.y + (neg_mx.y - neg_mn.y) * (iy + 0.5) / g
+                hit = ray_edge(negative, (x, y, neg_mx.z + span), (0, 0, -1))
+                if hit:
+                    high_pts.append(hit)
+        high_pts.sort(key=lambda p: -p.z)
+
+    boolean(outer, negative, 'DIFFERENCE')         # negative consumed
+    body = outer
+    body.name = "mould_body"
+
+    # ------------------------------------------------------------------------
+    # flat-bottom cut: bottom is ALWAYS open (the cradle is the floor). Cut at the
+    # model bottom so the cavity opens there and the model can seat in the cradle.
+    # ------------------------------------------------------------------------
+    if BASE_CUT is not None and BASE_CUT < 0:
+        cutz = None                                 # --nobase: no cut
+    else:
+        cutz = mn.z + (BASE_CUT or 0.0)
+    if cutz is not None:
+        log(f"flat bottom cut (open) @ z={cutz:.2f}")
+    cut_bottom_box(body)
+
+    # ------------------------------------------------------------------------
+    # 5. pour inlet: reservoir post at the pour point (= cavity apex / highest point).
+    #    A solid cylinder is UNIONed on top of the shell (overflow failsafe), then a
+    #    narrower bore is DRILLED down through it into the cavity so it never blocks
+    #    the hollow -- you pour into the bore and overflow stays in the reservoir.
+    # ------------------------------------------------------------------------
+    if POUR_MODE == "top" and high_pts:
+        sp = high_pts[0]                            # cavity apex = natural pour/vent point
+        res_top = sp.z + POUR_RES_H                 # reservoir rises above the shell roof
+        post_bot = sp.z + 0.5                       # post sits in the roof, not in the cavity
+        boolean(body, make_cyl("res", Vector((sp.x, sp.y, (res_top + post_bot) / 2)),
+                               POUR_R, res_top - post_bot), 'UNION')        # reservoir post
+        bore_bot = sp.z - 3.0                        # punch through roof into the cavity
+        boolean(body, make_cyl("bore", Vector((sp.x, sp.y, (res_top + 1 + bore_bot) / 2)),
+                               POUR_BORE, (res_top + 1) - bore_bot), 'DIFFERENCE')  # open bore
+        log(f"pour reservoir @ ({sp.x:.0f},{sp.y:.0f})  R{POUR_R}/bore{POUR_BORE}/h{POUR_RES_H}")
+
+    # ------------------------------------------------------------------------
+    # 6. base cradle (separate STL): centre pocket = base MODEL, outer recess =
+    #    mould SHELL. The ridge between them (= the silicone gap) seals the bottom.
+    #    Both pockets oversized by CRADLE_TOL for fit + base-material expansion.
+    # ------------------------------------------------------------------------
+    if ADD_CRADLE and cutz is not None:
+        shell_cut = offset_solid(body,   CRADLE_TOL, vs, "cr_shell")   # mould footprint + tol
+        model_cut = offset_solid(master, CRADLE_TOL, vs, "cr_model")   # base model + tol
+        smn, smx = world_bbox(shell_cut)
+        rim_z, bot_z = cutz + CRADLE_RECESS, cutz - CRADLE_FLOOR
+        plate = make_box("cradle",
+                         Vector((center.x, center.y, (rim_z + bot_z) / 2)),
+                         ((smx.x - smn.x) + 2 * CRADLE_WALL,
+                          (smx.y - smn.y) + 2 * CRADLE_WALL, rim_z - bot_z))
+        boolean(plate, shell_cut, 'DIFFERENCE')     # outer recess -> locates the shell
+        boolean(plate, model_cut, 'DIFFERENCE')     # centre pocket -> locates the model
+        export_stl(plate, os.path.join(outdir, f"{stem}_cradle.stl"))
+        rm(plate)
+        log(f"cradle: model pocket + shell recess (tol {CRADLE_TOL}mm)")
+
+    # ------------------------------------------------------------------------
+    # 7. split into pieces with vertical half-space boxes (+ ball keys)
+    # ------------------------------------------------------------------------
+    def halfspace(name, axis, keep_low):
+        """box occupying the keep side of the parting plane on the given axis."""
+        c = list(center)
+        d = list((2*span, 2*span, 2*span))
+        ai = 0 if axis == 'X' else 1
+        d[ai] = span
+        c[ai] = (center[ai] - span/2) if keep_low else (center[ai] + span/2)
+        return make_box(name, Vector(c), d)
+
+    def cut(piece, cutters):
+        for cb in cutters:
+            # MANIFOLD solver: faster + robust for the sequential two-cut 4-piece split;
+            # EXACT silently returns empty on the second INTERSECT in Blender 5.x.
+            boolean(piece, cb, 'INTERSECT', solver='MANIFOLD')
+        return piece
+
+    # ball-key registration. Keys sit on the parting plane(s), seated just inside
+    # the ACTUAL flange edge (found by ray-cast, so they hug the silhouette and
+    # never float). Convention: +side of a plane = male ball, -side = socket.
+    keys_on = ADD_PINS and ADD_FLANGE
+    inset = PIN_RADIUS + 2.0                              # seat the ball this far in from the lip edge
+
+    # pin heights: spread N keys up the parting line (15%..85% of model height).
+    # N auto-scales at ~1 per 40mm of height.
+    n_pins = PIN_COUNT if PIN_COUNT else max(1, int(size.z / 40) + 1)
+    if n_pins == 1:
+        pin_zs = [center.z]
+    else:
+        zlo, zhi = mn.z + 0.15 * size.z, mn.z + 0.85 * size.z
+        pin_zs = [zlo + (zhi - zlo) * k / (n_pins - 1) for k in range(n_pins)]
+    if keys_on:
+        log(f"pins: up to {n_pins} per interface")
+
+    def lip(plus, along, pz):
+        """find pin coord on axis `along` ('x'/'y') just inside the flange edge,
+        at height pz, on the +side (plus=True) or -side. None if no flange there."""
+        o = list(center); d = [0.0, 0.0, 0.0]; ax = 0 if along == 'x' else 1
+        o[2] = pz
+        o[ax] = (center[ax] + span) if plus else (center[ax] - span)
+        d[ax] = -1.0 if plus else 1.0
+        e = ray_edge(body, o, d)
+        if e is None:
+            return None
+        return (e[ax] - inset) if plus else (e[ax] + inset)
+
+    def key(piece, point, male):
+        """add a ball boss (male) or socket (female) to a piece at point."""
+        if male:
+            boolean(piece, make_ball(f"{piece.name}_m", point, PIN_RADIUS), 'UNION')
+        else:
+            boolean(piece, make_ball(f"{piece.name}_f", point, PIN_RADIUS + PIN_CLEAR), 'DIFFERENCE')
+
+    pieces = []
+    if FOUR_PIECE:
+        combos = [("xl_yl", True,  True),
+                  ("xh_yl", False, True),
+                  ("xl_yh", True,  False),
+                  ("xh_yh", False, False)]
+        for tag, xlo, ylo in combos:                       # xlo: on -X side, ylo: on -Y side
+            p = dup(body, f"piece_{tag}")
+            cut(p, [halfspace(f"hs1_{tag}", 'X', xlo),
+                    halfspace(f"hs2_{tag}", 'Y', ylo)])
+            if keys_on:
+                for pz in pin_zs:
+                    px = lip(not xlo, 'x', pz)             # Y-plane key on this piece's X side
                     if px is not None:
                         key(p, Vector((px, center.y, pz)), male=not ylo)
-        pieces.append((tag, p))
-    rm(body)
+                    py = lip(not ylo, 'y', pz)             # X-plane key on this piece's Y side
+                    if py is not None:
+                        key(p, Vector((center.x, py, pz)), male=not xlo)
+            pieces.append((tag, p))
+        rm(body)
+    else:
+        for tag, ylo in (("yl", True), ("yh", False)):
+            p = dup(body, f"piece_{tag}")
+            cut(p, [halfspace(f"hs_{tag}", 'Y', ylo)])
+            if keys_on:
+                for pz in pin_zs:
+                    for xplus in (False, True):            # keys at both -X and +X lips
+                        px = lip(xplus, 'x', pz)
+                        if px is not None:
+                            key(p, Vector((px, center.y, pz)), male=not ylo)
+            pieces.append((tag, p))
+        rm(body)
 
-for tag, p in pieces:
-    export_stl(p, os.path.join(outdir, f"{stem}_mould_{tag}.stl"))
+    for tag, p in pieces:
+        export_stl(p, os.path.join(outdir, f"{stem}_mould_{tag}.stl"))
 
-extras = []
-if POUR_MODE == "top": extras.append("sprue")
-if ADD_CRADLE: extras.append("cradle")
-log(f"DONE -> {len(pieces)} mould pieces" + (f" + {', '.join(extras)}" if extras else "") + f" in {outdir}")
+    extras = []
+    if POUR_MODE == "top": extras.append("sprue")
+    if ADD_CRADLE: extras.append("cradle")
+    log(f"DONE -> {len(pieces)} mould pieces" + (f" + {', '.join(extras)}" if extras else "") + f" in {outdir}")
+
+# ----------------------------------------------------------------------------
+# dispatch: run immediately in --background mode; defer to a timer in GUI mode
+# so the pipeline runs after Blender's window/event loop is fully initialised
+# (running scene-mutating bpy.ops during early --python startup raises
+# "context is incorrect" / missing active_object in GUI mode). timer callbacks
+# also run with a windowless restricted context, so wrap main() in temp_override
+# too -- otherwise even bpy.context.active_object raises AttributeError.
+# ----------------------------------------------------------------------------
+def _run_gui():
+    with bpy.context.temp_override(**_gui_win()):
+        main()
+
+if bpy.app.background:
+    main()
+else:
+    bpy.app.timers.register(_run_gui, first_interval=0.1)
