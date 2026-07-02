@@ -1,0 +1,79 @@
+make_mold.py -- command examples
+=================================
+
+BLENDER = "C:\Program Files\Blender Foundation\Blender 5.1\blender.exe"
+
+----- BASIC -----
+
+4-piece mold (default):
+  & $BLENDER --background --python make_mold.py -- input.stl
+
+2-piece mold:
+  & $BLENDER --background --python make_mold.py -- input.stl --two
+
+Output to specific folder:
+  & $BLENDER --background --python make_mold.py -- input.stl C:\output\mold1
+
+----- WALL THICKNESS -----
+
+Thin temp mold  (wall = SHELL_OFFSET - CORE_OFFSET = 4.5 - 3.0 = 1.5mm):
+  & $BLENDER --background --python make_mold.py -- input.stl --shell 4.5 --core 3.0
+
+Standard mold  (wall = 7.0 - 3.0 = 4mm):
+  & $BLENDER --background --python make_mold.py -- input.stl --shell 7.0 --core 3.0
+
+Tight cavity  (wall = 5.0 - 2.0 = 3mm, thinner silicone gap):
+  & $BLENDER --background --python make_mold.py -- input.stl --shell 5.0 --core 2.0
+
+----- POUR / VENTS -----
+
+Bottom pour (no reservoir, no vents -- pour through open base):
+  & $BLENDER --background --python make_mold.py -- input.stl --pour bottom
+
+Custom funnel mouth radius:
+  & $BLENDER --background --python make_mold.py -- input.stl --funnel 8.0
+
+No vents:
+  & $BLENDER --background --python make_mold.py -- input.stl --novents
+
+More vent holes (up to 5):
+  & $BLENDER --background --python make_mold.py -- input.stl --vent-n 5
+
+Smaller vent bore (0.8mm):
+  & $BLENDER --background --python make_mold.py -- input.stl --vent 0.8
+
+----- STAB FEET -----
+
+Force 4 feet only:
+  & $BLENDER --background --python make_mold.py -- input.stl --stab-n 4
+
+Cylinder feet instead of cones:
+  & $BLENDER --background --python make_mold.py -- input.stl --stab-shape cyl
+
+No stab feet:
+  & $BLENDER --background --python make_mold.py -- input.stl --nostab
+
+----- REGISTRATION PINS -----
+
+No flange, no pins (bare split):
+  & $BLENDER --background --python make_mold.py -- input.stl --noflange
+
+Custom pin radius:
+  & $BLENDER --background --python make_mold.py -- input.stl --pin 3.0
+
+Fixed pin count per interface:
+  & $BLENDER --background --python make_mold.py -- input.stl --pins-n 3
+
+----- COMBINED EXAMPLES -----
+
+Thin 2-piece temp mold, no cradle, bottom pour:
+  & $BLENDER --background --python make_mold.py -- input.stl --two --shell 4.5 --core 3.0 --pour bottom --nocradle
+
+Full production 4-piece, thick wall, more vents:
+  & $BLENDER --background --python make_mold.py -- input.stl --shell 8.0 --core 3.0 --vent-n 5 --pins-n 3
+
+High-detail fine voxel (slower, sharper geometry):
+  & $BLENDER --background --python make_mold.py -- input.stl --voxel 0.3 --target 12000
+
+cap_high_res test (quick defaults):
+  & $BLENDER --background --python make_mold.py -- cap_high_res.stl test_out

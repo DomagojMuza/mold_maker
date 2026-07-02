@@ -37,7 +37,7 @@ Notes:
     i.e. discrete Minkowski sum with a sphere), same idea as Meshmixer "Make Solid".
 """
 
-import bpy, bmesh, sys, os
+import bpy, bmesh, sys, os, math
 from mathutils import Vector
 
 # ----------------------------------------------------------------------------
@@ -80,6 +80,14 @@ VENT_BORE     = 1.0    # mm, vent bore radius (small on purpose)
 VENT_POST_R   = 2.5    # mm, vent post outer radius (thin wall around the small bore)
 VENT_MIN_SEP  = 25.0   # mm, min XY distance a vent must keep from the pour point + other vents
 VENT_MAX_N    = 3      # max number of vent holes added
+
+# stabilization feet: cones/cylinders on the shell top so the mold sits flat when
+# flipped upside down. Feet height = pour-post top + 1mm so posts never touch the table.
+ADD_STAB     = True
+STAB_R       = 5.0    # mm, foot base radius (where foot meets shell surface)
+STAB_TIP_R   = 2.0    # mm, foot tip radius (the end that touches the table when flipped)
+STAB_N       = None   # None = auto (scales with model perimeter, min 4); int = fixed count
+STAB_SHAPE   = "cone" # "cone" (tapered) | "cyl" (flat-ended cylinder)
 
 # base cradle: locates the base MODEL (centre pocket) AND the mould shell (outer
 # recess); the thin ridge between them seals the silicone gap at the bottom.
@@ -205,10 +213,12 @@ def make_cyl(name, center, r, depth):
 
 def ray_edge(obj, origin, direction):
     """world-space hit point where a ray first meets obj, or None."""
-    mw = obj.matrix_world; invw = mw.inverted()
-    ol = invw @ Vector(origin)
-    dl = (invw.to_3x3() @ Vector(direction)).normalized()
-    res = obj.ray_cast(ol, dl)
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    ev  = obj.evaluated_get(depsgraph)
+    mw  = ev.matrix_world; invw = mw.inverted()
+    ol  = invw @ Vector(origin)
+    dl  = (invw.to_3x3() @ Vector(direction)).normalized()
+    res = ev.ray_cast(ol, dl)
     return (mw @ res[1]) if res[0] else None
 
 def mesh_volume(obj):
@@ -256,6 +266,10 @@ while i < len(argv):
     elif a == "--vent":     VENT_BORE = float(argv[i+1]); i += 1
     elif a == "--vent-post":VENT_POST_R = float(argv[i+1]); i += 1
     elif a == "--vent-n":   VENT_MAX_N = int(argv[i+1]); i += 1
+    elif a == "--nostab":   ADD_STAB = False
+    elif a == "--stab-r":   STAB_R = float(argv[i+1]); i += 1
+    elif a == "--stab-n":   STAB_N = int(argv[i+1]); i += 1
+    elif a == "--stab-shape": STAB_SHAPE = argv[i+1]; i += 1
     elif a == "--nocradle": ADD_CRADLE = False
     elif not a.startswith("--"): outdir = os.path.abspath(a)
     i += 1
@@ -308,9 +322,13 @@ def main():
     maxdim = max(size.x, size.y, size.z)
     diag   = size.length
     span   = maxdim * 4.0                       # big enough to cover everything
-    # voxel size: auto from bbox, but CAPPED at 0.5mm -- coarser than that makes the
-    # EXACT booleans fail (the offset surfaces under-resolve and the carve collapses).
-    vs     = VOXEL_SIZE if VOXEL_SIZE else min(max(diag / VOXEL_DETAIL, 0.25), 0.5)
+    # voxel size: auto from bbox, capped at 0.5mm (coarser → EXACT booleans fail).
+    # Second cap: wall = SHELL_OFFSET - CORE_OFFSET must span ≥4 voxels or EXACT
+    # collapses on thin walls (1.2mm wall needs ≤0.3mm voxel).
+    vs     = VOXEL_SIZE if VOXEL_SIZE else min(max(diag / VOXEL_DETAIL, 0.1), 0.5)
+    wall_thick = SHELL_OFFSET - CORE_OFFSET
+    if not VOXEL_SIZE and wall_thick > 0:
+        vs = min(vs, wall_thick / 4)
     log(f"bbox {tuple(round(v,1) for v in size)}  voxel={vs:.3f}mm")
 
     cutz = None   # flat-bottom cut height, decided after the cavity is built (pour mode)
@@ -387,6 +405,7 @@ def main():
                     high_pts.append(hit)
         high_pts.sort(key=lambda p: -p.z)
 
+    cavity_cutter = dup(negative, "cavity_cutter")  # saved for trimming vents + stab feet
     boolean(outer, negative, 'DIFFERENCE')         # negative consumed
     body = outer
     body.name = "mould_body"
@@ -449,18 +468,81 @@ def main():
                 if len(vent_pts) >= VENT_MAX_N:
                     break
             for vp in vent_pts:
-                vpost_bot = vp.z + 0.5                   # post sits in the roof, not in the cavity
-                boolean(body, make_cyl("ventpost", Vector((vp.x, vp.y, (res_top + vpost_bot) / 2)),
-                                       VENT_POST_R, res_top - vpost_bot), 'UNION')   # vent post
-                vbore_bot = vp.z - 2.0                    # punch through roof into the cavity
+                vpost_bot = vp.z + 0.5
+                vpost = make_cyl("ventpost", Vector((vp.x, vp.y, (res_top + vpost_bot) / 2)),
+                                 VENT_POST_R, res_top - vpost_bot)
+                boolean(vpost, dup(cavity_cutter, "vccopy"), 'DIFFERENCE', solver='MANIFOLD')
+                boolean(body, vpost, 'UNION', solver='MANIFOLD')
+                vbore_bot = vp.z - 2.0
                 boolean(body, make_cyl("ventbore", Vector((vp.x, vp.y, (res_top + 1 + vbore_bot) / 2)),
-                                       VENT_BORE, (res_top + 1) - vbore_bot), 'DIFFERENCE')  # air bore
+                                       VENT_BORE, (res_top + 1) - vbore_bot), 'DIFFERENCE', solver='MANIFOLD')
             if vent_pts:
+                voxel_remesh(body, vs)      # restore manifold state after MANIFOLD UNIONs
                 log(f"air vents: {len(vent_pts)} @ post R{VENT_POST_R}/bore R{VENT_BORE}mm, "
                     f"top matched to pour (z={res_top:.1f})")
 
     # ------------------------------------------------------------------------
-    # 6. base cradle (separate STL): centre pocket = base MODEL, outer recess =
+    # 6. stabilization feet: ring around the outer perimeter of the shell top.
+    #    When the mold is flipped upside down these feet are the lowest point,
+    #    keeping the pour/vent posts 1mm above the table so they don't snap off.
+    # ------------------------------------------------------------------------
+    if not (ADD_STAB and POUR_MODE == "top" and high_pts):
+        rm(cavity_cutter)
+    if ADD_STAB and POUR_MODE == "top" and high_pts:
+        bpy.context.view_layer.update()             # flush depsgraph so ray_cast sees current mesh
+        mn_b, mx_b = world_bbox(body)
+        cx_b = (mn_b.x + mx_b.x) / 2
+        cy_b = (mn_b.y + mx_b.y) / 2
+        rx_b = (mx_b.x - mn_b.x) / 2
+        ry_b = (mx_b.y - mn_b.y) / 2
+        perimeter = 4 * (rx_b + ry_b)               # bbox perimeter approximation
+        n_feet = max(4, STAB_N if STAB_N else int(perimeter / 80))
+        foot_top_z = res_top + 1.0                  # 1mm above tallest post
+        # half-step offset so feet land between the split planes (not on them)
+        angle_step = 2 * math.pi / n_feet
+        angle_off  = angle_step / 2
+        # shoot horizontal rays from center outward at model mid-height to find the
+        # actual outer shell edge (more reliable than a fixed-percentage bbox position)
+        mid_z_ray = mn_b.z + (mx.z - mn_b.z) * 0.3   # lower third: shell is widest here
+        placed = []
+        for i in range(n_feet):
+            theta = angle_step * i + angle_off
+            dx, dy = math.cos(theta), math.sin(theta)
+            # step 1: horizontal ray from center outward -> outer shell surface XY
+            horiz = ray_edge(body, (cx_b, cy_b, mid_z_ray), (dx, dy, 0))
+            if not horiz:
+                continue
+            # pull inward by 2×STAB_R so the foot base lands on the flat shell top
+            # (not dangling off the outer edge), while the tip still overhangs outward
+            fx = horiz.x - dx * (STAB_R * 2.0)
+            fy = horiz.y - dy * (STAB_R * 2.0)
+            # step 2: downward ray from above -> shell top surface z at that XY
+            hit = ray_edge(body, (fx, fy, mx_b.z + 20), (0, 0, -1))
+            if not hit:
+                continue
+            # sink base 5mm for solid attachment; cavity intrusion is cleaned below
+            base_z = hit.z - 5.0
+            foot_h = foot_top_z - base_z
+            if foot_h < 1.0:
+                continue                            # surface already near/above target
+            mid_z = (foot_top_z + base_z) / 2
+            if STAB_SHAPE == "cyl":
+                foot = make_cyl("stab", Vector((fx, fy, mid_z)), STAB_R, foot_h)
+            else:
+                foot = make_cone("stab", Vector((fx, fy, mid_z)), STAB_R, STAB_TIP_R, foot_h)
+            # trim foot: dup a fresh cutter each time (reusing as boolean operand
+            # corrupts the shared object's internal BVH across multiple iterations)
+            boolean(foot, dup(cavity_cutter, "fcutter"), 'DIFFERENCE', solver='MANIFOLD')
+            boolean(body, foot, 'UNION', solver='MANIFOLD')  # foot consumed here
+            placed.append((fx, fy))
+        rm(cavity_cutter)
+        if placed:
+            voxel_remesh(body, vs)      # restore manifold state after MANIFOLD UNIONs
+        log(f"stab feet: {len(placed)}/{n_feet} placed, base R{STAB_R}/tip R{STAB_TIP_R}, "
+            f"top z={foot_top_z:.1f}mm")
+
+    # ------------------------------------------------------------------------
+    # 7. base cradle (separate STL): centre pocket = base MODEL, outer recess =
     #    mould SHELL. The ridge between them (= the silicone gap) seals the bottom.
     #    Both pockets oversized by CRADLE_TOL for fit + base-material expansion.
     # ------------------------------------------------------------------------
