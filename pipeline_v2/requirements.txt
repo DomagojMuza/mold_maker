@@ -1,0 +1,7 @@
+# pipeline_v2 deps (installed into ../offset_bench/.venv)
+meshlib            # offset + boolean + decimate  (bundles its own OpenVDB)
+trimesh            # validation / mesh interchange
+numpy
+pyvista            # 3-D view
+pyvistaqt          # Qt side panel (embeds the pyvista view)
+PyQt5             # Qt toolkit for the panel
