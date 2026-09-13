@@ -10,7 +10,9 @@ point in the current mode. The right dock has every other knob (spin boxes +
 check boxes) plus the phase action buttons.
 
 Keys (focus the 3-D view):
-    P  pour mode         S  split mode (press again: X<->Y plane)
+    P  pour mode         S  split mode (press again: cycles X / Y / extra planes)
+    N  add an extra split plane (own pivot + angle - for wings/limbs the
+       base X/Y pair can't give a clean pull direction)
     V  vent (phase 2)    F  foot (phase 2)
     U  undo current      C  clear current phase's picks
     G / Enter  = the dock's primary action (Build shell / Finish)
@@ -19,7 +21,7 @@ Phase 1 sets the shell + pour + parting planes -> Build shell.
 Phase 2 places vents/feet on the real shell + tunes cradle/lip/pins -> Finish.
 Any pick category left empty auto-places.  Output -> <stem>_v2out/.
 """
-import os, sys, io, time
+import os, sys, io, time, math
 os.environ.setdefault("QT_API", "pyqt5")
 
 import numpy as np
@@ -37,14 +39,18 @@ PIECE_COL = ["#dd8866", "#88cc77", "#7799dd", "#e0cc66"]
 
 # (attr, label, lo, hi, step, decimals)
 FIELDS = {
-    "pick1": [("SHELL_OFFSET", "Shell offset (mm)", 0.5, 20, 0.1, 1),
+    "pick1": [("MODEL_OFFSET_X", "Model offset X", -1000, 1000, 1.0, 1),
+              ("MODEL_OFFSET_Y", "Model offset Y", -1000, 1000, 1.0, 1),
+              ("SHELL_OFFSET", "Shell offset (mm)", 0.5, 20, 0.1, 1),
               ("CORE_OFFSET", "Core / silicone gap", 0.0, 15, 0.1, 1),
               ("FLANGE_REACH", "Flange reach", 0.0, 40, 0.5, 1),
               ("FLANGE_THICK", "Flange thickness", 0.0, 25, 0.5, 1),
-              ("POUR_R", "Pour post R", 1.0, 20, 0.5, 1),
-              ("POUR_BORE", "Pour bore R", 0.3, 15, 0.1, 1),
-              ("POUR_RES_H", "Pour post height", 2.0, 50, 1.0, 1),
-              ("VOXEL", "Voxel  (0 = auto)", 0.0, 2.0, 0.05, 2)],
+              ("POUR_R", "Pour post R", 0.1, 1000, 0.5, 1),
+              ("POUR_BORE", "Pour bore R", 0.1, 1000, 0.1, 1),
+              ("POUR_RES_H", "Pour post height", 0.0, 1000, 1.0, 1),
+              ("VOXEL", "Voxel  (0 = auto)", 0.0, 2.0, 0.05, 2),
+              ("SPLIT_ANGLE_X", "Split angle X (deg)", -180, 180, 5, 0),
+              ("SPLIT_ANGLE_Y", "Split angle Y (deg)", -180, 180, 5, 0)],
     "pick2": [("CRADLE_MARGIN", "Cradle margin", 2, 50, 0.5, 1),
               ("CRADLE_RECESS", "Cradle recess", 0.5, 15, 0.5, 1),
               ("CRADLE_FLOOR", "Cradle floor", 1, 20, 0.5, 1),
@@ -65,6 +71,30 @@ CHECKS = {
               ("ADD_CRADLE", "Cradle"), ("ADD_LIP", "Clamping lip"),
               ("ADD_PINS", "Registration pins")],
 }
+
+
+class _Worker(QtCore.QObject):
+    """Runs a slow callable (build_shell / finish_mould, several seconds of
+    pure MeshLib work, no Qt/GUI touched) on a worker QThread so the Qt event
+    loop keeps pumping and the render window stays alive/repainting instead
+    of going blank while the main thread is blocked - the long-standing
+    'GUI generate blocks the window' gap, which on Windows can leave the 3D
+    view showing nothing at all until the OS decides to repaint it."""
+    done = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def run(self):
+        try:
+            result = self.fn()
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self.failed.emit(str(e))
+        else:
+            self.done.emit(result)
 
 
 def to_pv(mesh):
@@ -106,6 +136,7 @@ class Main(QtWidgets.QMainWindow):
         self.picks = {"pour": [], "vent": [], "foot": []}
         self.split_x = self.split_y = None
         self.split_axis = "x"
+        self.extra_planes = []   # [{"x":.., "y":.., "angle":..}, ...] -- see _add_plane
         self.state = None
         self.dyn = []          # scene meshes
         self.markers = []      # pick markers + split guides + pour preview
@@ -125,7 +156,9 @@ class Main(QtWidgets.QMainWindow):
 
         for k, fn in {"p": lambda: self._set_mode("pour"), "v": lambda: self._set_mode("vent"),
                       "f": lambda: self._set_mode("foot"), "s": self._split_key,
+                      "n": self._add_plane,
                       "u": self._undo, "c": self._clear,
+                      "Left": lambda: self._nudge_angle(-5), "Right": lambda: self._nudge_angle(5),
                       "g": self._primary, "Return": self._primary}.items():
             self.plotter.add_key_event(k, fn)
 
@@ -142,17 +175,43 @@ class Main(QtWidgets.QMainWindow):
         self.stem = os.path.splitext(os.path.basename(self.src))[0]
         self.outdir = os.path.join(os.path.dirname(self.src), f"{self.stem}_v2out")
         self.setWindowTitle(f"mold_maker v2 - {self.stem}")
-        self.master_pv = pv.read(self.src)
+        self._master_base = pv.read(self.src)          # never moved; offset copies are derived from this
+        self.master_pv = self._master_base
+        self.diag = self.master_pv.length
+        self.cfg.MODEL_OFFSET_X = self.cfg.MODEL_OFFSET_Y = 0.0
         b = self.master_pv.bounds
         self.center = np.array([(b[0] + b[1]) / 2, (b[2] + b[3]) / 2, (b[4] + b[5]) / 2])
-        self.diag = self.master_pv.length
         self.state = None
         self.picks = {"pour": [], "vent": [], "foot": []}
         self.split_x = self.split_y = None
         self.split_axis = "x" if self.cfg.FOUR_PIECE else "y"
+        self.extra_planes = []
         self.btn_primary.setEnabled(True)
         self._refresh_paths()
         self._enter_pick1()
+
+    def _apply_model_offset(self, new_ox, new_oy):
+        """Slide the model under a FIXED world-space split axis. Surface
+        picks (pour/vent/foot) move with the model since they're tied to a
+        feature on it; the split pivot (once explicitly set) stays put in
+        world space so sliding the model actually changes which part of it
+        falls on which side of the cut. An unset (auto) split pivot tracks
+        the model's own centre, which itself moves with the model."""
+        dx, dy = new_ox - self.cfg.MODEL_OFFSET_X, new_oy - self.cfg.MODEL_OFFSET_Y
+        self.cfg.MODEL_OFFSET_X, self.cfg.MODEL_OFFSET_Y = new_ox, new_oy
+        if dx == 0 and dy == 0:
+            return
+        self.master_pv = self._master_base.translate((new_ox, new_oy, 0.0), inplace=False)
+        b = self.master_pv.bounds
+        self.center = np.array([(b[0] + b[1]) / 2, (b[2] + b[3]) / 2, (b[4] + b[5]) / 2])
+        shift = np.array([dx, dy, 0.0])
+        for cat in self.picks:
+            self.picks[cat] = [q + shift for q in self.picks[cat]]
+        if self.phase == "pick1":
+            self._clear_scene()
+            self.dyn.append(self.plotter.add_mesh(self.master_pv, color="#c9c9c9",
+                                                  smooth_shading=True, name="master"))
+            self._redraw_markers()
 
     def _refresh_paths(self):
         self.model_lbl.setText(self._elide(self.src)); self.model_lbl.setToolTip(self.src)
@@ -187,12 +246,14 @@ class Main(QtWidgets.QMainWindow):
         paths = QtWidgets.QGridLayout()
         paths.addWidget(QtWidgets.QLabel("Model"), 0, 0)
         self.model_lbl = QtWidgets.QLabel("-"); paths.addWidget(self.model_lbl, 0, 1)
-        mb = QtWidgets.QPushButton("Browse..."); mb.clicked.connect(self._browse_model)
-        paths.addWidget(mb, 0, 2)
+        self.btn_browse_model = QtWidgets.QPushButton("Browse...")
+        self.btn_browse_model.clicked.connect(self._browse_model)
+        paths.addWidget(self.btn_browse_model, 0, 2)
         paths.addWidget(QtWidgets.QLabel("Output"), 1, 0)
         self.out_lbl = QtWidgets.QLabel("-"); paths.addWidget(self.out_lbl, 1, 1)
-        ob = QtWidgets.QPushButton("Browse..."); ob.clicked.connect(self._browse_output)
-        paths.addWidget(ob, 1, 2)
+        self.btn_browse_output = QtWidgets.QPushButton("Browse...")
+        self.btn_browse_output.clicked.connect(self._browse_output)
+        paths.addWidget(self.btn_browse_output, 1, 2)
         paths.setColumnStretch(1, 1)
         ov.addLayout(paths)
 
@@ -211,6 +272,32 @@ class Main(QtWidgets.QMainWindow):
         self.shape_combo.currentTextChanged.connect(self._on_shape)
         sr.addWidget(self.shape_combo, 1)
         ov.addWidget(self.shape_row)
+
+        # extra split planes (phase 1 only) - own pivot + angle each, for
+        # limbs/wings the base X/Y pair can't give a clean pull direction
+        self.planes_box = QtWidgets.QGroupBox("Extra split planes (wings, limbs...)")
+        pv_lay = QtWidgets.QVBoxLayout(self.planes_box)
+        self.planes_list = QtWidgets.QListWidget()
+        self.planes_list.setMaximumHeight(70)
+        self.planes_list.currentRowChanged.connect(self._on_plane_row)
+        pv_lay.addWidget(self.planes_list)
+        prow = QtWidgets.QHBoxLayout()
+        addp = QtWidgets.QPushButton("+ Add (N)"); addp.clicked.connect(self._add_plane)
+        remp = QtWidgets.QPushButton("- Remove"); remp.clicked.connect(self._remove_active_plane)
+        prow.addWidget(addp); prow.addWidget(remp)
+        pv_lay.addLayout(prow)
+        pform = QtWidgets.QFormLayout()
+        self.plane_x_sb = QtWidgets.QDoubleSpinBox(); self.plane_x_sb.setRange(-100000, 100000); self.plane_x_sb.setDecimals(1)
+        self.plane_y_sb = QtWidgets.QDoubleSpinBox(); self.plane_y_sb.setRange(-100000, 100000); self.plane_y_sb.setDecimals(1)
+        self.plane_a_sb = QtWidgets.QDoubleSpinBox(); self.plane_a_sb.setRange(-1000, 1000); self.plane_a_sb.setDecimals(1)
+        self.plane_a_sb.setSingleStep(5)
+        for sb, key in ((self.plane_x_sb, "x"), (self.plane_y_sb, "y"), (self.plane_a_sb, "angle")):
+            sb.valueChanged.connect(lambda v, k=key: self._on_plane_spin(k, v))
+        pform.addRow("Pivot X", self.plane_x_sb)
+        pform.addRow("Pivot Y", self.plane_y_sb)
+        pform.addRow("Angle (deg)", self.plane_a_sb)
+        pv_lay.addLayout(pform)
+        ov.addWidget(self.planes_box)
 
         scroll = QtWidgets.QScrollArea(); scroll.setWidgetResizable(True)
         self.form_host = QtWidgets.QWidget()
@@ -249,17 +336,87 @@ class Main(QtWidgets.QMainWindow):
             cb.toggled.connect(lambda s, a=attr: self._set_param(a, s))
             self.form.addRow(label, cb)
         self.shape_row.setVisible(self.phase == "pick1")
+        self.planes_box.setVisible(self.phase == "pick1")
+        if self.phase == "pick1":
+            self._refresh_planes_list()
 
     def _set_param(self, attr, v):
+        if attr == "MODEL_OFFSET_X":
+            self._apply_model_offset(float(v), self.cfg.MODEL_OFFSET_Y); self._status(); return
+        if attr == "MODEL_OFFSET_Y":
+            self._apply_model_offset(self.cfg.MODEL_OFFSET_X, float(v)); self._status(); return
         if attr == "VOXEL":
             self.cfg.VOXEL = None if float(v) < 0.15 else float(v)
         elif isinstance(getattr(self.cfg, attr), bool):
             setattr(self.cfg, attr, bool(v))
         else:
             setattr(self.cfg, attr, float(v))
-        if attr in ("POUR_R", "POUR_BORE", "POUR_RES_H"):
+        if attr in ("POUR_R", "POUR_BORE", "POUR_RES_H", "SPLIT_ANGLE_X", "SPLIT_ANGLE_Y"):
             self._redraw_markers()
         self._status()
+
+    def _nudge_angle(self, delta):
+        """Left/Right arrow keys: rotate whichever plane is currently active in
+        split mode (S cycles x/y/extras) by 5 degrees, independent of the
+        others. No-op outside split mode - there'd be no way to say which plane."""
+        if self.phase != "pick1" or self.mode != "split":
+            return
+        if self.split_axis in ("x", "y"):
+            attr = "SPLIT_ANGLE_X" if self.split_axis == "x" else "SPLIT_ANGLE_Y"
+            sb = self._spins[attr]
+            sb.setValue(sb.value() + delta)   # fires _set_param via valueChanged
+        else:
+            idx = int(self.split_axis[1:])
+            self.extra_planes[idx]["angle"] += delta
+            self._refresh_planes_list()
+            self._redraw_markers(); self._status()
+
+    def _refresh_planes_list(self):
+        self.planes_list.blockSignals(True)
+        self.planes_list.clear()
+        for i, pl in enumerate(self.extra_planes):
+            self.planes_list.addItem(f"e{i}: ({pl['x']:.0f},{pl['y']:.0f})  {pl['angle']:.0f}deg")
+        if self.split_axis.startswith("e"):
+            row = int(self.split_axis[1:])
+            if row < self.planes_list.count():
+                self.planes_list.setCurrentRow(row)
+        self.planes_list.blockSignals(False)
+        self._sync_plane_spins()
+
+    def _sync_plane_spins(self):
+        idx = int(self.split_axis[1:]) if self.split_axis.startswith("e") else None
+        enabled = idx is not None and idx < len(self.extra_planes)
+        for sb in (self.plane_x_sb, self.plane_y_sb, self.plane_a_sb):
+            sb.blockSignals(True)
+        if enabled:
+            pl = self.extra_planes[idx]
+            self.plane_x_sb.setValue(pl["x"]); self.plane_y_sb.setValue(pl["y"]); self.plane_a_sb.setValue(pl["angle"])
+        for sb in (self.plane_x_sb, self.plane_y_sb, self.plane_a_sb):
+            sb.setEnabled(enabled)
+            sb.blockSignals(False)
+
+    def _on_plane_row(self, row):
+        if row < 0 or row >= len(self.extra_planes):
+            return
+        self.mode = "split"
+        self.split_axis = f"e{row}"
+        self._sync_plane_spins()
+        self._redraw_markers(); self._status()
+
+    def _on_plane_spin(self, key, v):
+        if not self.split_axis.startswith("e"):
+            return
+        idx = int(self.split_axis[1:])
+        if idx >= len(self.extra_planes):
+            return
+        self.extra_planes[idx][key] = float(v)
+        item = self.planes_list.item(idx) if idx < self.planes_list.count() else None
+        if item is not None:
+            pl = self.extra_planes[idx]
+            self.planes_list.blockSignals(True)
+            item.setText(f"e{idx}: ({pl['x']:.0f},{pl['y']:.0f})  {pl['angle']:.0f}deg")
+            self.planes_list.blockSignals(False)
+        self._redraw_markers(); self._status()
 
     def _on_shape(self, txt):
         self.cfg.POUR_SHAPE = txt
@@ -320,13 +477,43 @@ class Main(QtWidgets.QMainWindow):
            (self.phase == "pick2" and m in ("vent", "foot")):
             self.mode = m; self._status()
 
+    def _plane_axes(self):
+        """Ordered list of cyclable split-plane keys: base x[,y] + any extras."""
+        return (["x"] if self.cfg.FOUR_PIECE else []) + ["y"] + \
+               [f"e{i}" for i in range(len(self.extra_planes))]
+
     def _split_key(self):
         if self.phase != "pick1":
             return
         if self.mode != "split":
             self.mode = "split"
-        elif self.cfg.FOUR_PIECE:
-            self.split_axis = "y" if self.split_axis == "x" else "x"
+        else:
+            axes = self._plane_axes()
+            idx = axes.index(self.split_axis) if self.split_axis in axes else -1
+            self.split_axis = axes[(idx + 1) % len(axes)]
+        self._sync_plane_spins()
+        self._redraw_markers(); self._status()
+
+    def _add_plane(self):
+        """N: add one more independently-angled parting plane (its own pivot,
+        starts at model centre / 0deg) for shapes 2 planes can't handle alone
+        (e.g. a wing that sweeps off at its own angle)."""
+        if self.phase != "pick1":
+            return
+        self.extra_planes.append({"x": float(self.center[0]), "y": float(self.center[1]), "angle": 0.0})
+        self.mode = "split"
+        self.split_axis = f"e{len(self.extra_planes) - 1}"
+        self._refresh_planes_list()
+        self._redraw_markers(); self._status()
+
+    def _remove_active_plane(self):
+        if self.phase != "pick1" or not self.split_axis.startswith("e"):
+            return
+        idx = int(self.split_axis[1:])
+        if 0 <= idx < len(self.extra_planes):
+            del self.extra_planes[idx]
+        self.split_axis = "y"
+        self._refresh_planes_list()
         self._redraw_markers(); self._status()
 
     def _rmb_down(self, *a):
@@ -350,8 +537,13 @@ class Main(QtWidgets.QMainWindow):
         if self.mode == "split":
             if self.split_axis == "x":
                 self.split_x = float(xyz[0])
-            else:
+            elif self.split_axis == "y":
                 self.split_y = float(xyz[1])
+            else:
+                idx = int(self.split_axis[1:])
+                self.extra_planes[idx]["x"] = float(xyz[0])
+                self.extra_planes[idx]["y"] = float(xyz[1])
+                self._refresh_planes_list()
         elif self.mode == "pour":
             self.picks["pour"] = [xyz]
         else:
@@ -362,8 +554,13 @@ class Main(QtWidgets.QMainWindow):
         if self.mode == "split":
             if self.split_axis == "x":
                 self.split_x = None
-            else:
+            elif self.split_axis == "y":
                 self.split_y = None
+            else:
+                idx = int(self.split_axis[1:])
+                self.extra_planes[idx]["x"] = float(self.center[0])
+                self.extra_planes[idx]["y"] = float(self.center[1])
+                self._refresh_planes_list()
         elif self.mode == "pour":
             self.picks["pour"] = []
         elif self.picks.get(self.mode):
@@ -395,17 +592,30 @@ class Main(QtWidgets.QMainWindow):
 
     def _draw_split_guides(self):
         sx, sy = self._split_xy()
-        b = self.master_pv.bounds; pad = self.diag
-        ax, ay = self.mode == "split" and self.split_axis == "x", self.mode == "split" and self.split_axis == "y"
-        xz = pv.Plane(center=(sx, (b[2] + b[3]) / 2, (b[4] + b[5]) / 2), direction=(1, 0, 0),
-                      i_size=b[5] - b[4] + pad, j_size=b[3] - b[2] + pad)
-        yz = pv.Plane(center=((b[0] + b[1]) / 2, sy, (b[4] + b[5]) / 2), direction=(0, 1, 0),
-                      i_size=b[1] - b[0] + pad, j_size=b[5] - b[4] + pad)
+        b = self.master_pv.bounds
+        zc = (b[4] + b[5]) / 2
+        zsize = (b[5] - b[4]) + self.diag                # Z extent isn't affected by rotation
+        wsize = 2 * self.diag + 10                        # generous, orientation-independent
+
+        def plane_mesh(px, py, angle_deg):
+            r = math.radians(angle_deg)
+            return pv.Plane(center=(px, py, zc), direction=(math.cos(r), math.sin(r), 0.0),
+                            i_size=zsize, j_size=wsize)
+
+        ax = self.mode == "split" and self.split_axis == "x"
+        ay = self.mode == "split" and self.split_axis == "y"
         if self.cfg.FOUR_PIECE:
-            self.markers.append(self.plotter.add_mesh(xz, color=COL["split"], reset_camera=False, pickable=False,
+            self.markers.append(self.plotter.add_mesh(plane_mesh(sx, sy, self.cfg.SPLIT_ANGLE_X),
+                                color=COL["split"], reset_camera=False, pickable=False,
                                 opacity=0.32 if ax else 0.13, name="gx"))
-        self.markers.append(self.plotter.add_mesh(yz, color=COL["split"], reset_camera=False, pickable=False,
+        self.markers.append(self.plotter.add_mesh(plane_mesh(sx, sy, self.cfg.SPLIT_ANGLE_Y),
+                            color=COL["split"], reset_camera=False, pickable=False,
                             opacity=0.32 if ay else 0.13, name="gy"))
+        for i, pl in enumerate(self.extra_planes):        # wing/limb planes: own pivot, own colour
+            active = self.mode == "split" and self.split_axis == f"e{i}"
+            self.markers.append(self.plotter.add_mesh(plane_mesh(pl["x"], pl["y"], pl["angle"]),
+                                color="#3399ff", reset_camera=False, pickable=False,
+                                opacity=0.32 if active else 0.13, name=f"ge{i}"))
 
     def _draw_pour_preview(self):
         c = self.cfg
@@ -431,9 +641,16 @@ class Main(QtWidgets.QMainWindow):
             fx = "auto" if self.split_x is None else f"{self.split_x:.0f}"
             fy = "auto" if self.split_y is None else f"{self.split_y:.0f}"
             ax = f"  [moving {self.split_axis.upper()}]" if self.mode == "split" else ""
-            self.status.setText(f"PHASE 1  mode [{self.mode}]{ax}\n"
+            mo = (f"  model offset:({self.cfg.MODEL_OFFSET_X:.0f},{self.cfg.MODEL_OFFSET_Y:.0f})"
+                  if (self.cfg.MODEL_OFFSET_X or self.cfg.MODEL_OFFSET_Y) else "")
+            ep = f"  extra planes: {len(self.extra_planes)}" if self.extra_planes else ""
+            self.status.setText(f"PHASE 1  mode [{self.mode}]{ax}{mo}{ep}\n"
                                 f"pour {'set' if self.picks['pour'] else 'auto'} - "
-                                f"split X:{fx}  Y:{fy}\nP pour  S split  -  RIGHT-click to place")
+                                f"split X:{fx}  Y:{fy}\n"
+                                f"angle X:{self.cfg.SPLIT_ANGLE_X:.0f}deg  "
+                                f"Y:{self.cfg.SPLIT_ANGLE_Y:.0f}deg (independent)\n"
+                                f"P pour  S split (cycles x/y/extras)  N add plane\n"
+                                f"Left/Right = rotate active plane  -  RIGHT-click to place")
         elif self.phase == "pick2":
             self.status.setText(f"PHASE 2  mode [{self.mode}]\n"
                                 f"vents {len(self.picks['vent']) or 'auto'}   "
@@ -451,43 +668,96 @@ class Main(QtWidgets.QMainWindow):
         self.status.setText(msg)
         QtWidgets.QApplication.processEvents()
 
+    def _run_async(self, fn, on_done, fail_prefix):
+        """Run `fn` (no args, returns a picklable-free plain result - just
+        MeshLib objects/dicts, no Qt) on a worker thread; `on_done(result)`
+        runs back on the main/GUI thread once it finishes. Keeps the primary
+        button disabled (and the Qt event loop alive) for the duration.
+
+        The completion signals connect to bound methods of `self` (a QObject
+        that lives on the main thread), not plain closures - PyQt can only
+        infer 'queue this back onto the receiver's own thread' from a real
+        QObject receiver, so a bound method is what actually keeps the
+        MeshLib result handling (which touches VTK/Qt widgets) off the
+        worker thread. A closure here would run cross-thread instead."""
+        self.btn_primary.setEnabled(False)
+        self.btn_back.setEnabled(False)
+        self.btn_restart.setEnabled(False)
+        self.btn_browse_model.setEnabled(False)
+        self._bg_on_done, self._bg_fail_prefix = on_done, fail_prefix
+        thread = QtCore.QThread(self)
+        worker = _Worker(fn)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.done.connect(self._on_bg_done)
+        worker.failed.connect(self._on_bg_failed)
+        worker.done.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(thread.deleteLater)
+        # keep references alive for the thread's lifetime (Qt won't GC a
+        # thread/worker still running just because this function returned)
+        self._bg_thread, self._bg_worker = thread, worker
+        thread.start()
+
+    def _bg_ui_reset(self):
+        self.btn_restart.setEnabled(True)
+        self.btn_browse_model.setEnabled(True)
+        if self.phase != "result":
+            self.btn_primary.setEnabled(True)
+
+    def _on_bg_done(self, result):
+        self._bg_ui_reset()
+        self._bg_on_done(result)
+
+    def _on_bg_failed(self, msg):
+        self._bg_ui_reset()
+        self.status.setText(f"{self._bg_fail_prefix}:\n{msg}")
+
     def _build(self):
-        self._busy("building shell...  (see console)")
+        self._busy("building shell...  (running in background)")
         pour = [tuple(q) for q in self.picks["pour"]] or None
         split = (self.split_x, self.split_y)
-        try:
-            master = mr.loadMesh(self.src)
+        self.cfg.EXTRA_PLANES = [(pl["x"], pl["y"], pl["angle"]) for pl in self.extra_planes]
+        src, cfg = self.src, self.cfg
+
+        def work():
+            master = mr.loadMesh(src)
             mm._t0 = time.time()
-            self.state = mm.build_shell(self.cfg, master, pour=pour, split=split)
-        except Exception as e:
-            import traceback; traceback.print_exc()
-            self.status.setText(f"BUILD FAILED:\n{e}")
-            return
-        self._enter_pick2()
+            return mm.build_shell(cfg, master, pour=pour, split=split)
+
+        def done(state):
+            self.state = state
+            self._enter_pick2()
+
+        self._run_async(work, done, "BUILD FAILED")
 
     def _finish(self):
-        self._busy("finishing...  (see console)")
+        self._busy("finishing...  (running in background)")
         vents = [tuple(q) for q in self.picks["vent"]] or None
         feet = [tuple(q) for q in self.picks["foot"]] or None
         os.makedirs(self.outdir, exist_ok=True)
-        try:
+        cfg, state, outdir, stem = self.cfg, self.state, self.outdir, self.stem
+
+        def work():
             mm._t0 = time.time()
-            res = mm.finish_mould(self.cfg, self.state, vents=vents, feet=feet)
-        except Exception as e:
-            import traceback; traceback.print_exc()
-            self.status.setText(f"FINISH FAILED:\n{e}")
-            return
-        paths = []
-        for tag, msh in res["pieces"]:
-            fp = os.path.join(self.outdir, f"{self.stem}_mould_{tag}.stl")
-            mm.export(msh, fp, self.cfg.EXPORT_MAX_ERR)
-            paths.append((tag, fp))
-        cradle_path = None
-        if res["cradle"] is not None:
-            cradle_path = os.path.join(self.outdir, f"{self.stem}_cradle.stl")
-            mm.export(res["cradle"], cradle_path, self.cfg.EXPORT_MAX_ERR,
-                      voxel=self.cfg.VOXEL, reheal=True)
-        self._enter_result(paths, cradle_path)
+            res = mm.finish_mould(cfg, state, vents=vents, feet=feet)
+            paths = []
+            for tag, msh in res["pieces"]:
+                fp = os.path.join(outdir, f"{stem}_mould_{tag}.stl")
+                mm.export(msh, fp, cfg.EXPORT_MAX_ERR)
+                paths.append((tag, fp))
+            cradle_path = None
+            if res["cradle"] is not None:
+                cradle_path = os.path.join(outdir, f"{stem}_cradle.stl")
+                mm.export(res["cradle"], cradle_path, cfg.EXPORT_MAX_ERR,
+                          voxel=cfg.VOXEL, reheal=True)
+            return paths, cradle_path
+
+        def done(result):
+            paths, cradle_path = result
+            self._enter_result(paths, cradle_path)
+
+        self._run_async(work, done, "FINISH FAILED")
 
     def _back(self):
         if self.phase == "result" and self.state is not None:
@@ -499,6 +769,11 @@ class Main(QtWidgets.QMainWindow):
         for k in self.picks:
             self.picks[k] = []
         self.split_x = self.split_y = None
+        self.extra_planes = []
+        self.master_pv = self._master_base
+        self.cfg.MODEL_OFFSET_X = self.cfg.MODEL_OFFSET_Y = 0.0
+        b = self.master_pv.bounds
+        self.center = np.array([(b[0] + b[1]) / 2, (b[2] + b[3]) / 2, (b[4] + b[5]) / 2])
         self.btn_primary.setEnabled(True)
         self._enter_pick1()
 

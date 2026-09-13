@@ -18,7 +18,7 @@ built on MeshLib instead of bpy:
 
 Reusable entry point for the GUI: `generate(cfg, master, pour=, vents=, feet=)`.
 """
-import sys, os, time, math
+import sys, os, time, math, itertools
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple
 
@@ -37,8 +37,24 @@ class Config:
     FLANGE_THICK: float = 6.0
     FOUR_PIECE: bool = True
     VOXEL: Optional[float] = None      # None -> auto from model size (diag/200, clamped)
-    SPLIT_X: Optional[float] = None    # parting-plane X (world mm); None -> model bbox centre
-    SPLIT_Y: Optional[float] = None    # parting-plane Y
+    MODEL_OFFSET_X: float = 0.0        # mm, slides the master in X before anything else runs
+    MODEL_OFFSET_Y: float = 0.0        # mm, slides the master in Y
+    SPLIT_X: Optional[float] = None    # parting-plane pivot X (world mm); None -> model bbox centre
+    SPLIT_Y: Optional[float] = None    # parting-plane pivot Y
+    SPLIT_ANGLE_X: float = 0.0         # degrees, normal direction of the X-like plane (xlo/xhi); independent of Y
+    SPLIT_ANGLE_Y: float = 90.0        # degrees, normal direction of the Y-like plane (ylo/yhi, and the only
+                                       # plane used for --two). Default 90 = perpendicular to X, i.e. old behaviour.
+    EXTRA_PLANES: List[Tuple[float, float, float]] = field(default_factory=list)
+    # each (pivot_x, pivot_y, angle_deg) is one MORE full-height parting plane
+    # beyond the base X/Y pair, with its OWN pivot -- for shapes (swept wings,
+    # a protruding limb) where 2 planes crossing at one point can't give every
+    # part a clean pull direction. Every extra plane doubles the candidate
+    # piece count (one more sequential ISECT per piece); combos that don't
+    # intersect the shell are dropped automatically. Registration pins on
+    # extra planes use simple self-parity keying (independent of the other
+    # planes) with an extra keep_largest() pass to drop a pin ball that landed
+    # outside that particular cut -- less refined than the base X/Y pin
+    # scheme, but robust for a pivot that isn't centred on the whole shell.
 
     ADD_PINS: bool = True
     PIN_RADIUS: float = 2.0
@@ -105,6 +121,20 @@ def offset(mesh, dist, voxel, raw=True):
 def box(cx, cy, cz, sx, sy, sz):
     return mr.makeCube(V(sx, sy, sz), V(cx - sx/2, cy - sy/2, cz - sz/2))
 
+def rot_box(pivot_x, pivot_y, angle_deg, local_center, size):
+    """A box built at `local_center` (offset from the origin, full `size`), then
+    the WHOLE local frame is rotated by angle_deg around Z and moved so the local
+    origin lands on (pivot_x, pivot_y). Since local_center encodes the box's
+    offset from the origin, this rotates the box about the pivot, not its own
+    centre -- exactly what a pair of parting planes crossing at a point need."""
+    b = box(local_center[0], local_center[1], local_center[2], size[0], size[1], size[2])
+    if angle_deg:
+        R = mr.Matrix3f.rotation(V(0, 0, 1), math.radians(angle_deg))
+        b.transform(mr.AffineXf3f(R, V(pivot_x, pivot_y, 0)))
+    else:
+        b.transform(mr.AffineXf3f.translation(V(pivot_x, pivot_y, 0)))
+    return b
+
 def cyl(x, y, z0, z1, r, res=48):
     m = mr.makeCylinder(float(r), float(z1 - z0), res)
     m.transform(mr.AffineXf3f.translation(V(x, y, z0)))
@@ -131,6 +161,22 @@ def ray(mesh, origin, direction):
     n = (d.x*d.x + d.y*d.y + d.z*d.z) ** 0.5
     h = mr.rayMeshIntersect(mesh, mr.Line3f(V(*origin), V(d.x/n, d.y/n, d.z/n)))
     return None if h is None else (h.proj.point.x, h.proj.point.y, h.proj.point.z)
+
+def local_radius(mesh, cx, cy, z, span, n=12):
+    """Min surface distance from (cx,cy) at height z, sampled over n outward
+    directions -- a cheap proxy for 'how wide is the model here'. Used to
+    stop a wide pour post from overhanging a spot too thin to support it."""
+    best = None
+    for i in range(n):
+        th = 2 * math.pi * i / n
+        dx, dy = math.cos(th), math.sin(th)
+        h = ray(mesh, (cx + span * dx, cy + span * dy, z), (-dx, -dy, 0))
+        if h is not None:
+            d = math.hypot(h[0] - cx, h[1] - cy)
+            if best is None or d < best:
+                best = d
+    return best
+
 
 def keep_largest(m):
     keep = mr.MeshComponents.getLargestComponent(mr.MeshPart(m))
@@ -164,6 +210,8 @@ def build_shell(cfg: Config, master, pour=None, split=None):
     """Phase A - heal, offsets, flange, cavity carve, flat bottom, pour inlet.
     `split` = (x, y) parting-plane position in world mm, else cfg.SPLIT_* , else
     model centre. Returns a `state` dict consumed by finish_mould()."""
+    if cfg.MODEL_OFFSET_X or cfg.MODEL_OFFSET_Y:      # slide the master before anything reads its bbox
+        master.transform(mr.AffineXf3f.translation(V(cfg.MODEL_OFFSET_X, cfg.MODEL_OFFSET_Y, 0.0)))
     (mnx, mny, mnz), (mxx, mxy, mxz) = bbox(master)
     cx, cy = (mnx + mxx) / 2, (mny + mxy) / 2
     size = (mxx - mnx, mxy - mny, mxz - mnz)
@@ -174,9 +222,19 @@ def build_shell(cfg: Config, master, pour=None, split=None):
     sxs, sys_ = (split if split else (cfg.SPLIT_X, cfg.SPLIT_Y))
     split_x = sxs if sxs is not None else cx
     split_y = sys_ if sys_ is not None else cy
+    angle_x, angle_y = cfg.SPLIT_ANGLE_X, cfg.SPLIT_ANGLE_Y   # each plane's own normal direction
+    # full plane list: base X[,Y] pair (shared split_x/split_y pivot, as before)
+    # + any extra planes, each with its OWN pivot/angle -- see Config.EXTRA_PLANES.
+    planes = []
+    if cfg.FOUR_PIECE:
+        planes.append(("x", split_x, split_y, angle_x))
+    planes.append(("y", split_x, split_y, angle_y))
+    for i, (px, py, ang) in enumerate(cfg.EXTRA_PLANES):
+        planes.append((f"e{i}", float(px), float(py), float(ang)))
     vs = cfg.VOXEL if cfg.VOXEL else min(max(diag / 200.0, 0.30), 1.5)
     log(f"master {nfaces(master):,} tris  bbox {tuple(round(s,1) for s in size)}  "
-        f"voxel {vs:.3f}  split ({split_x:.1f},{split_y:.1f})")
+        f"voxel {vs:.3f}  split ({split_x:.1f},{split_y:.1f})  angles ({angle_x:.0f},{angle_y:.0f})deg  "
+        f"planes {len(planes)}")
 
     # -- heal the source ONCE (SDF round-trip). Raw STLs have self-intersections
     # / non-manifold edges that make later slab clips and booleans fail.
@@ -187,17 +245,29 @@ def build_shell(cfg: Config, master, pour=None, split=None):
     cavity = offset(master, cfg.CORE_OFFSET,  vs, raw=True)            # silicone-gap solid
     log(f"outer {nfaces(outer):,}  cavity {nfaces(cavity):,}")
 
-    # -- flange bands sit ON the parting planes (split_x / split_y), not the
-    # bbox centre, so the cut lands in flange meat not thin shell.
+    # -- flange bands sit ON the parting planes through the split pivot, not the
+    # bbox centre, so the cut lands in flange meat not thin shell. Each plane
+    # gets its own band, independently angled: a band thin along its own normal
+    # and wide (spanning `span`) along the perpendicular is built by rotating a
+    # (FLANGE_THICK, span, zh) box so its local x-axis (the thin one) lands on
+    # that plane's own normal direction -- no shared frame between the two.
+    def plane_band(px, py, angle_deg, zc, zh):
+        return rot_box(px, py, angle_deg, (0, 0, zc), (cfg.FLANGE_THICK, span, zh))
+
     (_, _, ozlo), (_, _, ozhi) = bbox(outer)
     if cfg.FLANGE_THICK > 0:
         fblob = offset(outer, cfg.FLANGE_REACH, vs)
         zc = (ozlo - 10.0 + ozhi) / 2
         zh = ozhi - (ozlo - 10.0)
-        outer = boolop(outer, boolop(fblob, box(cx, split_y, zc, span, cfg.FLANGE_THICK, zh), ISECT), UNION)
-        if cfg.FOUR_PIECE:
-            outer = boolop(outer, boolop(fblob, box(split_x, cy, zc, cfg.FLANGE_THICK, span, zh), ISECT), UNION)
-        log(f"flange merged   outer {nfaces(outer):,}")
+        merged = 0
+        for label, px, py, ang in planes:
+            try:                                   # one bad plane's flange must not sink the whole build
+                band = plane_band(px, py, ang, zc, zh)
+                outer = boolop(outer, boolop(fblob, band, ISECT), UNION)
+                merged += 1
+            except RuntimeError as e:
+                log(f"  flange band '{label}' skipped: {e}")
+        log(f"flange merged ({merged}/{len(planes)} plane(s))   outer {nfaces(outer):,}")
 
     body = boolop(outer, cavity, DIFF)
     body = boolop(body, box(cx, cy, cutz + span, 4*maxdim, 4*maxdim, 2*span), ISECT)   # flat open bottom
@@ -223,20 +293,93 @@ def build_shell(cfg: Config, master, pour=None, split=None):
     shp = cfg.POUR_SHAPE
     sp = apex(cavity, pour)
     res_top = sp[2] + cfg.POUR_RES_H
-    pbore = min(cfg.POUR_BORE, cfg.POUR_R - 1.5)
+    pbore = max(0.1, cfg.POUR_BORE)                 # no upper clamp - bore can exceed the post
+    if abs(pbore - cfg.POUR_R) < 0.3:              # bore == post wall -> coincident faces; nudge clear
+        pbore = cfg.POUR_R + 0.3
+    mouth = max(0.1, cfg.POUR_R - 1.0)              # funnel / counterbore mouth radius
     fbot = res_top - min(cfg.FUNNEL_H, cfg.POUR_RES_H - 1.0)
-    body = boolop(body, prism(sp[0], sp[1], sp[2] + 0.5, res_top, cfg.POUR_R, shp), UNION)
+
+    # -- a post wider than the model actually is up here (thin spike/ridge +
+    # a big requested hole) has no real material to bond to, and a full-width
+    # bore dropped straight down can drill clean through the model's side
+    # wall instead of just opening into the cavity from above. Measure the
+    # local shell width at the apex and, if the post would exceed it, grow
+    # BOTH the post and the bore from that local width up to the full
+    # POUR_R/pbore with a matching cone taper -- same idea as the existing
+    # top-of-bore funnel, mirrored at the base. The two ramps are linear so
+    # their wall thickness only needs checking at the endpoints (its minimum
+    # can't dip below either one): base_bore is kept >= MIN_WALL inside
+    # base_r, and the top end inherits whatever gap POUR_R vs pbore already
+    # has (including the near-equal nudge above, unaffected by this).
+    MIN_WALL = 1.5
+    local_r = local_radius(outer, sp[0], sp[1], sp[2], span)
+    post_z0, bore_z0 = sp[2] + 0.5, sp[2] - 3.0
+    tapered = False
+    if local_r is not None and local_r < cfg.POUR_R - MIN_WALL:
+        tapered = True
+        # floor base_r/base_bore comfortably above the voxel size -- hugging an
+        # exact local_r that's itself thinner than ~2 voxels (a knife-thin tip)
+        # builds geometry the boolean engine can't reliably represent, so a
+        # small overhang at the very base is the safer trade there
+        base_r = max(local_r - MIN_WALL, vs * 3.0, 2.0)
+        base_bore = max(min(pbore, base_r - MIN_WALL), vs * 1.5, 0.3)
+        # cap the taper to the room actually available between the apex and
+        # where the funnel/counterbore starts (fbot) -- a big POUR_R needing
+        # a tall taper on a short POUR_RES_H can otherwise push taper_top
+        # ABOVE fbot, which hands the final straight bore cut a NEGATIVE
+        # height cylinder (z0 > z1); MeshLib doesn't error on that, it just
+        # builds inverted/garbage geometry that erases the whole mesh on
+        # subtraction. Always leave at least 1mm of straight section.
+        max_taper_h = max(fbot - 1.0 - post_z0, 1.0)
+        taper_h = min(max(cfg.POUR_R - base_r, 4.0), max_taper_h)
+        taper_top = post_z0 + taper_h
+        if taper_h < cfg.POUR_R - base_r:
+            log(f"  pour taper compressed to {taper_h:.1f}mm (POUR_RES_H too short for a "
+                f"smooth {cfg.POUR_R - base_r:.1f}mm taper here) - increase Pour post height for a smoother transition")
+        OVERLAP = 0.5   # the straight post/bore below start a hair INSIDE the cone's
+                         # top instead of exactly at it -- an exact shared seam at the
+                         # same radius is a coincident-face crash (same issue as the
+                         # lip-tunnel fix), a slice of real volumetric overlap isn't
+        body = boolop(body, cone(sp[0], sp[1], post_z0, taper_top + OVERLAP, base_r, cfg.POUR_R), UNION)
+        body = boolop(body, cone(sp[0], sp[1], bore_z0, taper_top + OVERLAP, base_bore, pbore), DIFF)
+        post_z0 = bore_z0 = taper_top - OVERLAP
+        log(f"  pour taper: local width {local_r:.1f}mm < post {cfg.POUR_R:.1f}mm -> "
+            f"cone {base_r:.1f}->{cfg.POUR_R:.1f}mm over {taper_h:.1f}mm")
+
+    body = boolop(body, prism(sp[0], sp[1], post_z0, res_top, cfg.POUR_R, shp), UNION)
     if shp == "square":            # square counterbore mouth instead of a cone
         body = boolop(body, box(sp[0], sp[1], (fbot + res_top + 1) / 2,
-                                2*(cfg.POUR_R - 1), 2*(cfg.POUR_R - 1), res_top + 1 - fbot), DIFF)
+                                2*mouth, 2*mouth, res_top + 1 - fbot), DIFF)
     else:
-        body = boolop(body, cone(sp[0], sp[1], fbot, res_top + 1.0, pbore, cfg.POUR_R - 1.0), DIFF)
-    body = boolop(body, prism(sp[0], sp[1], sp[2] - 3.0, fbot + 0.5, pbore, shp), DIFF)   # bore
+        body = boolop(body, cone(sp[0], sp[1], fbot, res_top + 1.0, pbore, mouth), DIFF)
+    body = boolop(body, prism(sp[0], sp[1], bore_z0, fbot + 0.5, pbore, shp), DIFF)   # bore
+    if tapered:
+        # the deliberate cone/cylinder overlap above (needed to dodge a
+        # coincident-face crash) can leave a few tiny spurious handles at
+        # this scale -- same SDF-reheal trick already used for the open-top
+        # self-intersection fix elsewhere in this file. At an extreme taper
+        # (a big POUR_R on a very thin apex) the SDF round-trip can itself
+        # misbehave and gut the mesh instead of cleaning it up, so the
+        # result is sanity-checked against the pre-reheal body and only
+        # kept if it isn't drastically smaller -- a body with 0 (or a
+        # handful of) faces here silently propagates into "empty" flange/
+        # split failures much further downstream, which is far worse than
+        # just skipping this cleanup pass.
+        pre_faces = nfaces(body)
+        try:
+            healed = keep_largest(offset(body, 0.0, vs))
+            if nfaces(healed) >= pre_faces * 0.5:
+                body = healed
+            else:
+                log(f"  pour reheal shrank the shell ({pre_faces:,} -> {nfaces(healed):,} faces), keeping pre-reheal body")
+        except RuntimeError as e:
+            log(f"  pour reheal failed, keeping pre-reheal body: {e}")
     log(f"pour {shp} @ ({sp[0]:.0f},{sp[1]:.0f})  R{cfg.POUR_R}/bore{pbore}  top z={res_top:.1f}")
 
     return dict(master=master, body=body, cavity=cavity, sp=sp, res_top=res_top,
                 cx=cx, cy=cy, cutz=cutz, span=span, maxdim=maxdim, vs=vs,
-                mnz=mnz, mxz=mxz, size=size, split_x=split_x, split_y=split_y)
+                mnz=mnz, mxz=mxz, size=size, split_x=split_x, split_y=split_y,
+                angle_x=angle_x, angle_y=angle_y, planes=planes)
 
 
 def finish_mould(cfg: Config, st, vents=None, feet=None):
@@ -248,6 +391,8 @@ def finish_mould(cfg: Config, st, vents=None, feet=None):
     cx, cy, cutz, span = st["cx"], st["cy"], st["cutz"], st["span"]
     maxdim, vs, mnz, mxz, size = st["maxdim"], st["vs"], st["mnz"], st["mxz"], st["size"]
     split_x, split_y = st["split_x"], st["split_y"]
+    angle_x, angle_y = st["angle_x"], st["angle_y"]
+    planes = st["planes"]
 
     # -- 4. air vents --------------------------------------------
     if cfg.ADD_VENTS:
@@ -364,52 +509,104 @@ def finish_mould(cfg: Config, st, vents=None, feet=None):
         pin_zs = [lo + (hi - lo) * k / (n_pins - 1) for k in range(n_pins)]
     inset = cfg.PIN_RADIUS + 2.0
 
-    def edge_x(plus, pz):   # scan along X at the parting line y=split_y for the shell edge
-        h = ray(body, (split_x + (span if plus else -span), split_y, pz), (-1 if plus else 1, 0, 0))
-        return None if h is None else (h[0] - inset if plus else h[0] + inset)
+    # Each plane keeps its OWN normal direction (angle_x, angle_y) -- they no
+    # longer have to stay perpendicular. A plane's "band direction" (the line
+    # pins run along, and the direction that stays exactly ON that plane) is
+    # always 90deg from its own normal, independent of the other plane.
+    def hat(deg):
+        r = math.radians(deg)
+        return (math.cos(r), math.sin(r))
 
-    def edge_y(plus, pz):
-        h = ray(body, (split_x, split_y + (span if plus else -span), pz), (0, -1 if plus else 1, 0))
-        return None if h is None else (h[1] - inset if plus else h[1] + inset)
+    def edge_along(px, py, angle_deg, plus, pz):    # scan the given plane's own band line for the shell edge
+        h = hat(angle_deg + 90)
+        sgn = 1 if plus else -1
+        ox, oy = px + sgn * span * h[0], py + sgn * span * h[1]
+        hit = ray(body, (ox, oy, pz), (-sgn * h[0], -sgn * h[1], 0))
+        if hit is None:
+            return None
+        d = (hit[0] - px) * h[0] + (hit[1] - py) * h[1] - sgn * inset   # distance from pivot along h
+        return (px + d * h[0], py + d * h[1], pz)
 
     def key(piece, pt, male):
         if male:
             return boolop(piece, ball(*pt, cfg.PIN_RADIUS), UNION)
         return boolop(piece, ball(*pt, cfg.PIN_RADIUS + cfg.PIN_CLEAR), DIFF)
 
-    def quad_clip(xlo, ylo):
-        bx = split_x - span if xlo else split_x
-        by = split_y - span if ylo else split_y
-        return mr.makeCube(V(span, span, 2*span), V(bx, by, cutz - span))
+    def half_box(px, py, angle_deg, lo):
+        c = -span / 2 if lo else span / 2
+        return rot_box(px, py, angle_deg, (c, 0, cutz), (span, 2 * span, 2 * span))
 
+    # N-plane split: `planes` = [("x",...), ("y",...), ("e0",...), ...] (see
+    # build_shell). Each plane contributes ONE more sequential half-space
+    # ISECT per piece -> up to 2**N candidate quadrants; ones that don't
+    # actually intersect the shell (a real possibility once extra planes have
+    # their own off-centre pivot) are silently dropped. The first n_base
+    # planes (x[,y]) keep the EXACT original cross-wired pin scheme; any
+    # extra planes beyond that get simple self-parity pins on their own band,
+    # independent of the other planes, with a keep_largest() safety pass
+    # afterwards to drop a pin ball that landed outside this particular cut.
+    n_base = 2 if cfg.FOUR_PIECE else 1
+    N = len(planes)
     pieces = []
-    if cfg.FOUR_PIECE:
-        combos = [("xl_yl", 1, 1), ("xh_yl", 0, 1), ("xl_yh", 1, 0), ("xh_yh", 0, 0)]
-        for tag, xlo, ylo in combos:
-            p = boolop(body, quad_clip(xlo, ylo), ISECT)
+    for combo in itertools.product((1, 0), repeat=N):    # 1 = lo side, 0 = hi side
+        tag = "_".join(f"{planes[i][0]}{'l' if combo[i] else 'h'}" for i in range(N))
+        try:
+            p = body
+            for i in range(N):
+                _, px, py, ang = planes[i]
+                p = boolop(p, half_box(px, py, ang, combo[i]), ISECT)
+            if nfaces(p) < 20:
+                log(f"  combo {tag} empty, skipped")
+                continue
             p = keep_largest(p)
-            if cfg.ADD_PINS:
+        except RuntimeError as e:
+            log(f"  combo {tag} failed, skipped: {e}")
+            continue
+
+        if cfg.ADD_PINS:
+            if cfg.FOUR_PIECE:
+                xlo, ylo = combo[0], combo[1]
+                _, xpx, xpy, xang = planes[0]
+                _, ypx, ypy, yang = planes[1]
                 for pz in pin_zs:
-                    px = edge_x(not xlo, pz)
-                    if px is not None:
-                        p = key(p, (px, split_y, pz), male=not ylo)
-                    py = edge_y(not ylo, pz)
-                    if py is not None:
-                        p = key(p, (split_x, py, pz), male=not xlo)
-            pieces.append((tag, p))
-    else:
-        for tag, ylo in (("yl", 1), ("yh", 0)):
-            by = split_y - span if ylo else split_y
-            p = boolop(body, mr.makeCube(V(2*span, span, 2*span), V(cx - span, by, cutz - span)), ISECT)
-            p = keep_largest(p)
-            if cfg.ADD_PINS:
+                    pu = edge_along(xpx, xpy, xang, not xlo, pz)
+                    if pu is not None:
+                        p = key(p, pu, male=not ylo)
+                    pv = edge_along(ypx, ypy, yang, not ylo, pz)
+                    if pv is not None:
+                        p = key(p, pv, male=not xlo)
+            else:
+                ylo = combo[0]
+                _, ypx, ypy, yang = planes[0]
                 for pz in pin_zs:
                     for plus in (False, True):
-                        px = edge_x(plus, pz)
-                        if px is not None:
-                            p = key(p, (px, split_y, pz), male=not ylo)
-            pieces.append((tag, p))
-    log(f"split -> {len(pieces)} pieces" + ("  + pins" if cfg.ADD_PINS else ""))
+                        pu = edge_along(ypx, ypy, yang, plus, pz)
+                        if pu is not None:
+                            p = key(p, pu, male=not ylo)
+            for i in range(n_base, N):                    # extra planes: self-parity, both band ends
+                lo = combo[i]
+                _, px, py, ang = planes[i]
+                for pz in pin_zs:
+                    for plus in (False, True):
+                        pu = edge_along(px, py, ang, plus, pz)
+                        if pu is not None:
+                            p = key(p, pu, male=not lo)
+            if N > n_base:
+                p = keep_largest(p)   # drop a pin ball that landed outside this cut
+
+        # Final size gate on the piece as it will actually be exported: a pin ball
+        # (getLargestComponent picks by FACE COUNT, not physical size) can outrank
+        # a real but low-poly shell sliver at the step above, so this has to be
+        # checked here -- after pins -- not on the pre-pin candidate.
+        (pnx, pny, pnz), (pxx, pxy, pxz) = bbox(p)
+        pext = max(pxx - pnx, pxy - pny, pxz - pnz)
+        min_ext = max(10.0, 0.05 * maxdim)
+        if nfaces(p) < 50 or pext < min_ext:
+            log(f"  combo {tag} sliver ({nfaces(p)} faces, ext={pext:.1f}mm), skipped")
+            continue
+
+        pieces.append((tag, p))
+    log(f"split -> {len(pieces)}/{2**N} candidate pieces" + ("  + pins" if cfg.ADD_PINS else ""))
 
     return dict(pieces=pieces, cradle=cradle, pour=sp, res_top=res_top)
 
@@ -462,7 +659,9 @@ def main():
     if not args:
         raise SystemExit("usage: make_mold2.py <master.stl> [outdir] [--two] [--novents] "
                          "[--nofeet] [--nopins] [--nocradle] [--nolip] [--voxel N] [--split X,Y] "
-                         "[--split-x N] [--split-y N] [--pour-shape round|square]")
+                         "[--split-x N] [--split-y N] [--split-angle-x DEG] [--split-angle-y DEG] "
+                         "[--offset-x N] [--offset-y N] [--pour-shape round|square] "
+                         "[--extra-plane X,Y,DEG ...]")
     src = os.path.abspath(args[0])
     outdir = os.path.dirname(src)
     cfg = Config()
@@ -479,7 +678,14 @@ def main():
         elif a == "--split":    cfg.SPLIT_X, cfg.SPLIT_Y = (float(v) for v in args[i+1].split(",")); i += 1
         elif a == "--split-x":  cfg.SPLIT_X = float(args[i+1]); i += 1
         elif a == "--split-y":  cfg.SPLIT_Y = float(args[i+1]); i += 1
+        elif a == "--split-angle-x": cfg.SPLIT_ANGLE_X = float(args[i+1]); i += 1
+        elif a == "--split-angle-y": cfg.SPLIT_ANGLE_Y = float(args[i+1]); i += 1
+        elif a == "--offset-x": cfg.MODEL_OFFSET_X = float(args[i+1]); i += 1
+        elif a == "--offset-y": cfg.MODEL_OFFSET_Y = float(args[i+1]); i += 1
         elif a == "--pour-shape": cfg.POUR_SHAPE = args[i+1]; i += 1        # round | square
+        elif a == "--extra-plane":
+            x, y, ang = (float(v) for v in args[i+1].split(","))
+            cfg.EXTRA_PLANES.append((x, y, ang)); i += 1
         elif not a.startswith("--"): outdir = os.path.abspath(a)
         i += 1
     os.makedirs(outdir, exist_ok=True)

@@ -1,0 +1,7 @@
+meshlib
+trimesh
+numpy
+shapely
+svgpathtools
+mapbox_earcut
+pyvista

@@ -55,11 +55,37 @@ Finish / Back / Restart). Everything you can't click on the model lives there.
 **Mouse:** LEFT = rotate / pan / zoom (never places anything). **RIGHT-click the
 surface = place a point** in the current mode (a right-*drag* is a zoom, ignored).
 
-**Phase 1** (master shown): dock has shell/core/flange/pour/voxel spins + 4-piece
-check + pour shape. In the view: `P` = pour mode (translucent post+bore preview
-follows the pour spins live); `S` = split mode, press `S` again to toggle which
-parting plane a right-click moves - **X and Y independent** (2-piece: Y only),
-active plane is the brighter guide, un-set = model centre. **Build shell** / `G`.
+**Phase 1** (master shown): dock has **Model offset X** / **Model offset Y** at
+the top (slides the master under a FIXED world-space split axis - an explicit
+split pivot stays put, so sliding the model actually changes which part of it
+falls on which side of the cut; surface picks - pour point, vents, feet - move
+with the model since they're tied to a feature on it; an unset/auto split
+pivot still tracks the model's own centre), then shell/core/flange/pour/voxel
+spins + 4-piece check + pour shape, plus
+**Split angle X** and **Split angle Y** - two fully independent spin boxes; the
+two parting planes no longer have to stay perpendicular. In the view: `P` = pour
+mode (translucent post+bore preview
+follows the pour spins live); `S` = split mode, press `S` again to cycle which
+parting plane a right-click (position) or `Left`/`Right` arrow key (angle, 5° at
+a time) affects - **X, Y, then any extra planes** (2-piece: Y + extras only),
+active plane is the brighter guide, un-set X/Y position = model centre. Guide
+planes, flange bands and the split geometry itself all follow each plane's own
+angle. **Build shell** / `G`.
+
+**Extra split planes** - for a shape where 2 planes crossing at one point can't
+give every part a clean pull direction (e.g. wings swept back at their own
+angle on a figure): the **"Extra split planes"** box in the dock (`+ Add` / `N`,
+`- Remove`, plus Pivot X/Y + Angle spin boxes for whichever plane is active)
+adds one MORE independently-pivoted, independently-angled parting plane -
+position it with a right-click same as X/Y, rotate with `Left`/`Right` while
+it's active. Each extra plane doubles the candidate piece count (a 4-piece
+split + 2 extra planes = up to 16 candidates); combos that don't actually
+intersect the shell (e.g. "left of the sagittal AND right of the left-wing
+plane") are dropped automatically and logged, not exported. Registration pins
+on the base X/Y pair use the original cross-wired keying; pins on extra planes
+use simpler self-parity keying (their own band, both ends) since an extra
+plane's pivot isn't assumed to be centred on the whole shell the way X/Y's is.
+CLI: repeatable `--extra-plane X,Y,DEG`.
 
 **Phase 2** (built shell shown): dock has cradle/lip/pin/vent/foot spins + the
 ADD_* checks. In the view: `V` vent, `F` foot - right-click places on the ACTUAL
@@ -68,15 +94,49 @@ shell. **Finish & export** button / `G`.
 Result: **Back** (re-pick vents/feet, no rebuild) or **Restart**. `U` undo / `C`
 clear the current phase's picks. Empty pick category = auto. STLs -> `<stem>_v2out/`.
 
+**Build shell** and **Finish & export** run on a background thread - the 3D
+view and the rest of the UI stay responsive (and keep repainting) during the
+multi-second MeshLib run instead of freezing; the primary/back/restart/browse
+buttons just disable until it's done. On Windows especially, a long fully
+synchronous call used to leave the window looking blank/frozen until the OS
+got around to repainting it - this is what fixed that.
+
 The pipeline is split to match: `build_shell(cfg, master, pour=, split=)` ->
 state, then `finish_mould(cfg, state, vents=, feet=)`. `generate()` chains both
 for the CLI. CLI overrides: `--split X,Y` / `--split-x N` / `--split-y N` (world
-mm; unset axis = model centre); `--pour-shape round|square`.
+mm; unset axis = model centre); `--split-angle-x DEG` / `--split-angle-y DEG`
+(each plane's own normal direction, fully independent - defaults 0 / 90 =
+perpendicular = the old axis-aligned X/Y behaviour); `--offset-x N` / `--offset-y N`
+(slides the master in X/Y before anything else runs); `--pour-shape round|square`;
+`--extra-plane X,Y,DEG` (repeatable - one more independently-pivoted parting
+plane, see "Extra split planes" above).
 
 ## Verified (2026-09-09)
 
 gingerbread_7cm 7.7 s · zenska 9.1 s · Tesla_FINAL 12.1 s · baby_jesus 10.1 s ·
 cap_high_res 15.0 s - all: watertight pieces, 1 component, plausible volume, `flagged: 0`.
+
+## Pour hole on a thin model top
+
+A pour post/bore wider than the model actually is at the apex (a big requested
+hole landing on a thin spike, horn, or ridge) used to drop a full-width post
+straight onto whatever tiny sliver of material was there - an unsupported
+overhang barely attached to the model, and a bore that could drill through the
+side wall instead of just opening into the cavity. It now measures the local
+shell width at the apex and, if the post/bore would exceed it, grows both from
+that local width up to the full size with a cone taper - the pour post now has
+a real base to stand on no matter how thin the model's top is. The taper is
+capped to whatever vertical room the pour post height (`POUR_RES_H`) actually
+gives it before the funnel/counterbore has to start; a very wide post on a
+short post height compresses into a steeper taper rather than overshooting
+into the funnel zone (a log line says so when it happens - raise `POUR_RES_H`
+for a smoother transition instead). A piece whose pour post bridges over
+several small bumps/serrations right at the apex (e.g. a rooster-comb-style
+crest) can legitimately end up with a few small enclosed voids there and trip
+the euler-based sanity check with a `<-- CHECK` flag despite being perfectly
+valid (watertight, single component, correct volume) - more compressed tapers
+(wide post, short post height) trip it harder; eyeball that piece rather than
+treating the flag as a hard failure.
 
 ## Not done / known limits
 
@@ -88,8 +148,7 @@ cap_high_res 15.0 s - all: watertight pieces, 1 component, plausible volume, `fl
 - deep concavities between a figure's limbs bridge over (SHELL/CORE offsets close
   gaps < ~2x offset) - inherent to a glove mould at this size, same as Blender.
 - unit scaling (cm / m sources) not wired - assumes 1 unit = 1 mm.
-- GUI `generate` blocks the window for the ~10 s run (no worker thread yet).
-- tested on 5 STLs only.
+- tested on 5 STLs only (plus basilisk.stl for the N-plane split / pour-taper work).
 
 ## Deps
 
