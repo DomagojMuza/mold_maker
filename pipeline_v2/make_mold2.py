@@ -212,7 +212,28 @@ def build_shell(cfg: Config, master, pour=None, split=None):
     model centre. Returns a `state` dict consumed by finish_mould()."""
     if cfg.MODEL_OFFSET_X or cfg.MODEL_OFFSET_Y:      # slide the master before anything reads its bbox
         master.transform(mr.AffineXf3f.translation(V(cfg.MODEL_OFFSET_X, cfg.MODEL_OFFSET_Y, 0.0)))
-    (mnx, mny, mnz), (mxx, mxy, mxz) = bbox(master)
+
+    # -- heal the source ONCE (SDF round-trip), BEFORE reading any bbox/size
+    # off it. Raw STLs can carry stray disconnected junk (a sub-voxel sliver
+    # from a bad export, a support nub, debris) far outside the real model's
+    # footprint -- multi-part scene STLs (many separate, never-unioned
+    # objects) are especially prone to this. Such a fragment can be thinner
+    # than the voxel size and simply not survive the heal, but if `cutz`/
+    # `cx`/`cy`/`size` were captured from the RAW bbox first, everything
+    # downstream (flange bands, the flat-bottom clip, split defaults, and
+    # especially the cradle/lip Z math, which slices a thin window right
+    # around `cutz`) ends up anchored to a point in space where the ACTUAL
+    # healed geometry has nothing -- slicing an empty slab there, then
+    # unioning it into an empty cradle, is exactly what happened: a 20-vertex
+    # 0.3mm sliver ~16mm below the real model set `cutz` to empty space.
+    (rmnx, rmny, rmnz), (rmxx, rmxy, rmxz) = bbox(master)
+    rsize = (rmxx - rmnx, rmxy - rmny, rmxz - rmnz)
+    rdiag = sum(s**2 for s in rsize) ** 0.5
+    vs = cfg.VOXEL if cfg.VOXEL else min(max(rdiag / 200.0, 0.30), 1.5)
+    master = offset(master, 0.0, vs, raw=True)
+    log(f"healed master {nfaces(master):,} tris  (voxel {vs:.3f})")
+
+    (mnx, mny, mnz), (mxx, mxy, mxz) = bbox(master)   # authoritative bbox: the HEALED mesh
     cx, cy = (mnx + mxx) / 2, (mny + mxy) / 2
     size = (mxx - mnx, mxy - mny, mxz - mnz)
     maxdim = max(size)
@@ -231,15 +252,9 @@ def build_shell(cfg: Config, master, pour=None, split=None):
     planes.append(("y", split_x, split_y, angle_y))
     for i, (px, py, ang) in enumerate(cfg.EXTRA_PLANES):
         planes.append((f"e{i}", float(px), float(py), float(ang)))
-    vs = cfg.VOXEL if cfg.VOXEL else min(max(diag / 200.0, 0.30), 1.5)
     log(f"master {nfaces(master):,} tris  bbox {tuple(round(s,1) for s in size)}  "
         f"voxel {vs:.3f}  split ({split_x:.1f},{split_y:.1f})  angles ({angle_x:.0f},{angle_y:.0f})deg  "
         f"planes {len(planes)}")
-
-    # -- heal the source ONCE (SDF round-trip). Raw STLs have self-intersections
-    # / non-manifold edges that make later slab clips and booleans fail.
-    master = offset(master, 0.0, vs, raw=True)
-    log(f"healed master {nfaces(master):,} tris")
 
     outer  = offset(master, cfg.SHELL_OFFSET, vs, raw=True)
     cavity = offset(master, cfg.CORE_OFFSET,  vs, raw=True)            # silicone-gap solid
@@ -527,6 +542,33 @@ def finish_mould(cfg: Config, st, vents=None, feet=None):
         d = (hit[0] - px) * h[0] + (hit[1] - py) * h[1] - sgn * inset   # distance from pivot along h
         return (px + d * h[0], py + d * h[1], pz)
 
+    def side_of(pt, i):
+        """signed position of pt across plane i; <=0 == that plane's `lo` side
+        (matches half_box, whose lo box spans local x in [-span, 0])."""
+        _, px, py, ang = planes[i]
+        n = hat(ang)
+        return (pt[0] - px) * n[0] + (pt[1] - py) * n[1]
+
+    def pin_pts(i, combo, pz):
+        """Band ends of plane i that lie in THIS piece's half of every OTHER
+        plane -- i.e. the parts of plane i that this piece and its mate across
+        plane i actually share a face on. With one plane both ends qualify;
+        with the 4-piece X/Y pair each plane's band is halved by the other, so
+        exactly one end qualifies per piece; a band end that no combo of the
+        other planes' half-spaces contains is dropped (no pin there).
+        Which world-space end a `plus` scan lands on depends on the plane's own
+        angle, so the side test -- not the sign of `plus` -- is what decides."""
+        _, px, py, ang = planes[i]
+        out = []
+        for plus in (False, True):
+            pt = edge_along(px, py, ang, plus, pz)
+            if pt is None:
+                continue
+            if all((side_of(pt, j) <= 0) == bool(combo[j])
+                   for j in range(N) if j != i):
+                out.append(pt)
+        return out
+
     def key(piece, pt, male):
         if male:
             return boolop(piece, ball(*pt, cfg.PIN_RADIUS), UNION)
@@ -564,33 +606,19 @@ def finish_mould(cfg: Config, st, vents=None, feet=None):
             continue
 
         if cfg.ADD_PINS:
-            if cfg.FOUR_PIECE:
-                xlo, ylo = combo[0], combo[1]
-                _, xpx, xpy, xang = planes[0]
-                _, ypx, ypy, yang = planes[1]
+            # One rule for every plane: a pin lives ON plane i, at a band end
+            # that lies inside this piece's half of all the OTHER planes, and
+            # its sex flips with combo[i] -- so the two pieces that mate across
+            # plane i get the male and the female of the SAME ball. Getting
+            # either of those two parities from the wrong plane (the old code
+            # positioned the X-plane pin by xlo and sexed it by ylo, i.e. both
+            # swapped) puts each ball in only one piece: the mate's ball lands
+            # outside its own body, so you get a pin with no matching hole and
+            # a hole with no matching pin, on pieces that aren't even adjacent.
+            for i in range(N):
                 for pz in pin_zs:
-                    pu = edge_along(xpx, xpy, xang, not xlo, pz)
-                    if pu is not None:
-                        p = key(p, pu, male=not ylo)
-                    pv = edge_along(ypx, ypy, yang, not ylo, pz)
-                    if pv is not None:
-                        p = key(p, pv, male=not xlo)
-            else:
-                ylo = combo[0]
-                _, ypx, ypy, yang = planes[0]
-                for pz in pin_zs:
-                    for plus in (False, True):
-                        pu = edge_along(ypx, ypy, yang, plus, pz)
-                        if pu is not None:
-                            p = key(p, pu, male=not ylo)
-            for i in range(n_base, N):                    # extra planes: self-parity, both band ends
-                lo = combo[i]
-                _, px, py, ang = planes[i]
-                for pz in pin_zs:
-                    for plus in (False, True):
-                        pu = edge_along(px, py, ang, plus, pz)
-                        if pu is not None:
-                            p = key(p, pu, male=not lo)
+                    for pt in pin_pts(i, combo, pz):
+                        p = key(p, pt, male=not combo[i])
             if N > n_base:
                 p = keep_largest(p)   # drop a pin ball that landed outside this cut
 
@@ -640,12 +668,14 @@ def validate(mesh, maxdim, kind="piece"):
     and only flags euler when it is wildly negative (real corruption) or when a
     CRADLE - which has no channels by design - comes out non-genus-0."""
     import trimesh, io
+    if nfaces(mesh) == 0:            # an upstream step produced nothing -- report it, don't crash
+        return dict(watertight=False, euler=0, comps=0, vol_ml=0.0, ext=0.0, ok=False)
     buf = io.BytesIO()
     mr.saveMesh(mesh, "*.stl", buf)
     buf.seek(0)
     tm = trimesh.load(buf, file_type="stl", force="mesh")
     comps = len(tm.split(only_watertight=False))
-    ext = float(max(tm.extents))
+    ext = float(max(tm.extents)) if tm.extents is not None else 0.0
     euler = int(tm.euler_number)
     ok = (bool(tm.is_watertight) and comps == 1 and ext < 1.7 * maxdim and euler > -8)
     if kind == "cradle":

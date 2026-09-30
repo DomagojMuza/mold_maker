@@ -82,9 +82,10 @@ it's active. Each extra plane doubles the candidate piece count (a 4-piece
 split + 2 extra planes = up to 16 candidates); combos that don't actually
 intersect the shell (e.g. "left of the sagittal AND right of the left-wing
 plane") are dropped automatically and logged, not exported. Registration pins
-on the base X/Y pair use the original cross-wired keying; pins on extra planes
-use simpler self-parity keying (their own band, both ends) since an extra
-plane's pivot isn't assumed to be centred on the whole shell the way X/Y's is.
+follow one rule on every plane, base or extra: a pin sits ON that plane, at a
+band end that falls inside the piece's own half of all the OTHER planes, and its
+sex flips with that plane's side -- so the two pieces that mate across a plane
+get the male and the female of the SAME ball (see "Pin/hole pairing" below).
 CLI: repeatable `--extra-plane X,Y,DEG`.
 
 **Phase 2** (built shell shown): dock has cradle/lip/pin/vent/foot spins + the
@@ -137,6 +138,34 @@ the euler-based sanity check with a `<-- CHECK` flag despite being perfectly
 valid (watertight, single component, correct volume) - more compressed tapers
 (wide post, short post height) trip it harder; eyeball that piece rather than
 treating the flag as a hard failure.
+
+## Pin/hole pairing (fixed 2026-09-30)
+
+A 4-piece split used to hand out pins and holes that never met: each piece got
+one feature, two pieces were pin-only and two hole-only, and the two pieces
+sharing a site weren't the ones that got the pair. Cause: in the `FOUR_PIECE`
+pin block the two parities were swapped -- the X-plane pin's *position* along
+its band came from `xlo` (which side of the X plane the piece is on) and its
+*sex* from `ylo`, and the Y-plane pin was the mirror of that. Both are wrong:
+
+- plane X's band is halved by plane Y, so which half of it a piece touches is
+  set by `ylo`, not `xlo` -> the mate's ball landed in the far half, outside its
+  own body. `keep_largest()` on export then dropped it, so a `UNION` pin
+  silently vanished and a `DIFF` hole was a no-op.
+- sex has to alternate across the plane the ball lies ON, i.e. from `xlo` for an
+  X-plane pin -> as written, both mates got the same sex.
+
+Now one generic rule for all N planes (`pin_pts()`): take plane i's band ends,
+keep the ones inside this piece's half of every OTHER plane, sex them by
+`not combo[i]`. Which world-space end a `plus` scan lands on depends on that
+plane's own angle (`hat(ang+90)` flips sign at 90 deg), so the filter uses a
+signed side test against the other planes, never the sign of `plus`. 2-piece is
+unchanged (no other plane -> both band ends, as before); extra planes now get
+filtered by the base planes too instead of blindly keying both ends.
+
+Cylinder.stl, probing 1 mm either side of each of the 4 pin sites: before, all
+4 sites BAD (one feature, no mate); after, all 4 OK (one male + one female, on
+the two adjacent pieces).
 
 ## Not done / known limits
 
